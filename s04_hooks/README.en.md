@@ -201,7 +201,7 @@ Four hooks cover the critical nodes of the agent cycle: input → before executi
 
 ```sh
 cd learn-claude-code
-python s04_hooks/code.py
+python s04_hooks/demo_code.py
 ```
 
 Try these prompts:

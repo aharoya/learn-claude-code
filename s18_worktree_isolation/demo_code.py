@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-s17: Autonomous Agents — idle poll + auto-claim + WORK/IDLE lifecycle.
+s18: Worktree Isolation — git worktree + task-directory binding + event log.
 
-Run:  python s17_autonomous_agents/code.py
+Run:  python s18_worktree_isolation/demo_code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
-Changes from s16:
-  - scan_unclaimed_tasks: find pending, unowned tasks with deps completed
-  - idle_poll: 60s polling loop (inbox + task board), dispatches shutdown in IDLE
-  - claim_task: owner check + return value verification
-  - Teammate lifecycle: WORK → IDLE → SHUTDOWN
-  - Teammate tools: + list_tasks, claim_task, complete_task (5→8)
-  - consume_lead_inbox: unified inbox consumer for protocol + context injection
-  - Identity re-injection after context compression
+Changes from s17:
+  - Task dataclass gains worktree field (str | None)
+  - validate_worktree_name: reject path traversal and illegal chars
+  - create_worktree: validate name, git worktree add, optional task binding
+  - bind_task_to_worktree: write worktree field only, keep task pending
+  - remove_worktree: safety check before force, no auto-complete
+  - run_git returns (ok, output), events only on success
+  - Teammate tools: + complete_task, run in worktree cwd when bound
+  - scan_unclaimed_tasks: uses can_start() for dependency checking
+  - idle_poll: checks claim result, dispatches shutdown in IDLE
+  - consume_lead_inbox: unified inbox consumer
+  - 3 new Lead tools: create_worktree, remove_worktree, keep_worktree
 
-ASCII lifecycle:
-  WORK: inbox → LLM → tools → (tool_use? loop) → (done? → IDLE)
-  IDLE: 5s poll → inbox? → WORK / unclaimed? → claim → WORK / 60s? → SHUTDOWN
+ASCII topology:
+  Main repo (/)
+    ├── .worktrees/auth/  (branch: wt/auth)  ← Task #1
+    ├── .worktrees/ui/    (branch: wt/ui)     ← Task #2
+    ├── .tasks/task_xxx.json (worktree: "auth")
+    └── .worktrees/events.jsonl
 """
 
-import os, subprocess, json, time, random, threading
+import os, subprocess, json, time, random, threading, re
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
@@ -41,7 +48,7 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12) ──
+# ── Task System (from s12 + s18 worktree field) ──
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -55,6 +62,7 @@ class Task:
     status: str
     owner: str | None
     blockedBy: list[str]
+    worktree: str | None = None      # s18: bound worktree name
 
 
 def _task_path(task_id: str) -> Path:
@@ -86,7 +94,7 @@ def list_tasks() -> list[Task]:
             for p in sorted(TASKS_DIR.glob("task_*.json"))]
 
 
-def get_task(task_id: str) -> str:
+def get_task_json(task_id: str) -> str:
     task = load_task(task_id)
     return json.dumps(asdict(task), indent=2)
 
@@ -137,6 +145,124 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
+# ── Worktree System (s18 new) ──
+
+WORKTREES_DIR = WORKDIR / ".worktrees"
+WORKTREES_DIR.mkdir(exist_ok=True)
+
+VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+
+def validate_worktree_name(name: str) -> str | None:
+    """Return error message if invalid, None if valid."""
+    if not name:
+        return "Worktree name cannot be empty"
+    if name == "." or name == "..":
+        return f"'{name}' is not a valid worktree name"
+    if not VALID_WT_NAME.match(name):
+        return (f"Invalid worktree name '{name}': "
+                "only letters, digits, dots, underscores, dashes (1-64 chars)")
+    return None
+
+
+def run_git(args: list[str]) -> tuple[bool, str]:
+    """Run git command. Return (ok, output)."""
+    try:
+        r = subprocess.run(["git"] + args, cwd=WORKDIR,
+                           capture_output=True, text=True, timeout=30)
+        out = (r.stdout + r.stderr).strip()
+        out = out[:5000] if out else "(no output)"
+        return r.returncode == 0, out
+    except subprocess.TimeoutExpired:
+        return False, "Error: git timeout"
+
+
+def log_event(event_type: str, worktree_name: str, task_id: str = ""):
+    """Append a lifecycle event to events.jsonl."""
+    event = {"type": event_type, "worktree": worktree_name,
+             "task_id": task_id, "ts": time.time()}
+    events_file = WORKTREES_DIR / "events.jsonl"
+    with open(events_file, "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def create_worktree(name: str, task_id: str = "") -> str:
+    """Create a git worktree with a dedicated branch. Optionally bind to a task."""
+    err = validate_worktree_name(name)
+    if err:
+        return f"Error: {err}"
+    path = WORKTREES_DIR / name
+    if path.exists():
+        return f"Worktree '{name}' already exists at {path}"
+    ok, result = run_git(["worktree", "add", str(path), "-b", f"wt/{name}", "HEAD"])
+    if not ok:
+        return f"Git error: {result}"
+    if task_id:
+        bind_task_to_worktree(task_id, name)
+    log_event("create", name, task_id)
+    print(f"  \033[33m[worktree] created: {name} at {path}\033[0m")
+    return f"Worktree '{name}' created at {path}"
+
+
+def bind_task_to_worktree(task_id: str, worktree_name: str):
+    """Write worktree field to task. Keep status as pending for auto-claim."""
+    task = load_task(task_id)
+    task.worktree = worktree_name
+    save_task(task)
+    print(f"  \033[33m[bind] {task.subject} → worktree:{worktree_name}\033[0m")
+
+
+def _count_worktree_changes(path: Path) -> tuple[int, int]:
+    """Count uncommitted files and commits in a worktree."""
+    try:
+        r1 = subprocess.run(["git", "status", "--porcelain"],
+                            cwd=path, capture_output=True, text=True, timeout=10)
+        files = len([l for l in r1.stdout.strip().splitlines() if l.strip()])
+        r2 = subprocess.run(["git", "log", "@{push}..HEAD", "--oneline"],
+                            cwd=path, capture_output=True, text=True, timeout=10)
+        commits = len([l for l in r2.stdout.strip().splitlines() if l.strip()])
+        return files, commits
+    except Exception:
+        return -1, -1
+
+
+def remove_worktree(name: str, discard_changes: bool = False) -> str:
+    """Remove worktree. Refuses if uncommitted changes unless discard_changes."""
+    err = validate_worktree_name(name)
+    if err:
+        return err
+    path = WORKTREES_DIR / name
+    if not path.exists():
+        return f"Worktree '{name}' not found"
+    if not discard_changes:
+        files, commits = _count_worktree_changes(path)
+        if files < 0:
+            return (f"Cannot verify worktree '{name}' status. "
+                    "Use discard_changes=true to force removal.")
+        if files > 0 or commits > 0:
+            return (f"Worktree '{name}' has {files} uncommitted file(s) "
+                    f"and {commits} unpushed commit(s). "
+                    "Use discard_changes=true to force removal, "
+                    "or keep_worktree to preserve for review.")
+    ok1, _ = run_git(["worktree", "remove", str(path), "--force"])
+    if not ok1:
+        return f"Failed to remove worktree directory for '{name}'"
+    run_git(["branch", "-D", f"wt/{name}"])
+    log_event("remove", name)
+    print(f"  \033[33m[worktree] removed: {name}\033[0m")
+    return f"Worktree '{name}' removed"
+
+
+def keep_worktree(name: str) -> str:
+    """Keep worktree for manual review. Branch preserved."""
+    err = validate_worktree_name(name)
+    if err:
+        return err
+    log_event("keep", name)
+    print(f"  \033[36m[worktree] kept: {name}\033[0m")
+    return f"Worktree '{name}' kept for review (branch: wt/{name})"
+
+
 # ── Prompt Assembly (from s10) ──
 
 PROMPT_SECTIONS = {
@@ -144,7 +270,8 @@ PROMPT_SECTIONS = {
     "tools": "Available tools: bash, read_file, write_file, "
              "create_task, list_tasks, get_task, claim_task, complete_task, "
              "spawn_teammate, send_message, check_inbox, "
-             "request_shutdown, request_plan, review_plan.",
+             "request_shutdown, request_plan, review_plan, "
+             "create_worktree, remove_worktree, keep_worktree.",
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
 }
@@ -171,18 +298,19 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools (from s15) ──
+# ── Basic Tools ──
 
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
+def safe_path(p: str, cwd: Path = None) -> Path:
+    base = cwd or WORKDIR
+    path = (base / p).resolve()
+    if not path.is_relative_to(base):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 
-def run_bash(command: str) -> str:
+def run_bash(command: str, cwd: Path = None) -> str:
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
+        r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
                            capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
@@ -190,9 +318,9 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, limit: int | None = None, cwd: Path = None) -> str:
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path, cwd).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -200,9 +328,9 @@ def run_read(path: str, limit: int | None = None) -> str:
         return f"Error: {e}"
 
 
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str, cwd: Path = None) -> str:
     try:
-        fp = safe_path(path)
+        fp = safe_path(path, cwd)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"
@@ -241,7 +369,6 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
-
 # ── Protocol State (from s16) ──
 
 @dataclass
@@ -263,7 +390,6 @@ def new_request_id() -> str:
 
 
 def match_response(response_type: str, request_id: str, approve: bool):
-    """Correlate a response to the original request via request_id."""
     state = pending_requests.get(request_id)
     if not state:
         print(f"  \033[31m[protocol] unknown request_id: {request_id}\033[0m")
@@ -283,10 +409,22 @@ def match_response(response_type: str, request_id: str, approve: bool):
           f"({request_id}: {state.status})\033[0m")
 
 
-# ── Autonomous Agent (s17 new) ──
+def consume_lead_inbox(route_protocol=True) -> list[dict]:
+    msgs = BUS.read_inbox("lead")
+    if route_protocol:
+        for msg in msgs:
+            meta = msg.get("metadata", {})
+            req_id = meta.get("request_id", "")
+            msg_type = msg.get("type", "")
+            if req_id and msg_type.endswith("_response"):
+                match_response(msg_type, req_id, meta.get("approve", False))
+    return msgs
 
-IDLE_POLL_INTERVAL = 5   # seconds
-IDLE_TIMEOUT = 60         # seconds
+
+# ── Autonomous Agent (from s17, + worktree cwd) ──
+
+IDLE_POLL_INTERVAL = 5
+IDLE_TIMEOUT = 60
 
 
 def scan_unclaimed_tasks() -> list[dict]:
@@ -307,10 +445,8 @@ def idle_poll(agent_name: str, messages: list,
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
 
-        # Check inbox — dispatch protocol messages first
         inbox = BUS.read_inbox(agent_name)
         if inbox:
-            # Check for shutdown_request
             for msg in inbox:
                 if msg.get("type") == "shutdown_request":
                     req_id = msg.get("metadata", {}).get("request_id", "")
@@ -321,23 +457,25 @@ def idle_poll(agent_name: str, messages: list,
                           f"in idle ({req_id})\033[0m")
                     return "shutdown"
 
-            # Non-protocol inbox: inject and resume work
             messages.append({"role": "user",
                 "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
             print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
             return "work"
 
-        # Scan task board
         unclaimed = scan_unclaimed_tasks()
         if unclaimed:
-            task = unclaimed[0]
-            result = claim_task(task["id"], agent_name)
+            task_data = unclaimed[0]
+            result = claim_task(task_data["id"], agent_name)
             if "Claimed" in result:
+                wt_info = ""
+                if task_data.get("worktree"):
+                    wt_path = WORKTREES_DIR / task_data["worktree"]
+                    wt_info = f"\nWork directory: {wt_path}"
                 messages.append({"role": "user",
-                    "content": f"<auto-claimed>Task {task['id']}: "
-                               f"{task['subject']}</auto-claimed>"})
+                    "content": f"<auto-claimed>Task {task_data['id']}: "
+                               f"{task_data['subject']}{wt_info}</auto-claimed>"})
                 print(f"  \033[32m[idle] {name} auto-claimed: "
-                      f"{task['subject']}\033[0m")
+                      f"{task_data['subject']}\033[0m")
                 return "work"
             print(f"  \033[33m[idle] {name} claim failed: "
                   f"{result}\033[0m")
@@ -346,7 +484,7 @@ def idle_poll(agent_name: str, messages: list,
     return "timeout"
 
 
-# ── Teammate Thread (from s15 + s16 + s17) ──
+# ── Teammate Thread (from s15 + s16 + s17 + s18) ──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     if name in active_teammates:
@@ -355,10 +493,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
               f"You can list and claim tasks from the board. "
-              f"Check inbox for protocol messages.")
+              f"If a task has a worktree, work in that directory.")
 
     def handle_inbox_message(name: str, msg: dict, messages: list):
-        """Dispatch incoming protocol messages by type."""
         msg_type = msg.get("type", "message")
         meta = msg.get("metadata", {})
         req_id = meta.get("request_id", "")
@@ -382,6 +519,47 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         return False
 
     def run():
+        # Track current worktree for this teammate's cwd
+        wt_ctx = {"path": None}
+
+        def _wt_cwd() -> Path | None:
+            p = wt_ctx["path"]
+            return Path(p) if p else None
+
+        def _run_bash(command: str) -> str:
+            return run_bash(command, cwd=_wt_cwd())
+
+        def _run_read(path: str) -> str:
+            return run_read(path, cwd=_wt_cwd())
+
+        def _run_write(path: str, content: str) -> str:
+            return run_write(path, content, cwd=_wt_cwd())
+
+        def _run_list_tasks():
+            tasks = list_tasks()
+            if not tasks:
+                return "No tasks."
+            return "\n".join(
+                f"  {t.id}: {t.subject} [{t.status}]"
+                + (f" (wt:{t.worktree})" if t.worktree else "")
+                for t in tasks)
+
+        def _run_claim_task(task_id: str):
+            result = claim_task(task_id, owner=name)
+            if "Claimed" in result:
+                # Set worktree cwd if task has one
+                task = load_task(task_id)
+                if task.worktree:
+                    wt_ctx["path"] = str(WORKTREES_DIR / task.worktree)
+                else:
+                    wt_ctx["path"] = None
+            return result
+
+        def _run_complete_task(task_id: str):
+            result = complete_task(task_id)
+            wt_ctx["path"] = None
+            return result
+
         messages = [{"role": "user", "content": prompt}]
         sub_tools = [
             {"name": "bash", "description": "Run a shell command.",
@@ -408,7 +586,6 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
              "input_schema": {"type": "object",
                               "properties": {"plan": {"type": "string"}},
                               "required": ["plan"]}},
-            # s17 new: teammates can list, claim, and complete tasks
             {"name": "list_tasks",
              "description": "List all tasks on the board.",
              "input_schema": {"type": "object", "properties": {},
@@ -425,22 +602,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                               "required": ["task_id"]}},
         ]
 
-        def _run_list_tasks():
-            tasks = list_tasks()
-            if not tasks:
-                return "No tasks."
-            return "\n".join(
-                f"  {t.id}: {t.subject} [{t.status}]"
-                for t in tasks)
-
-        def _run_claim_task(task_id: str):
-            return claim_task(task_id, owner=name)
-
-        def _run_complete_task(task_id: str):
-            return complete_task(task_id)
-
         sub_handlers = {
-            "bash": run_bash, "read_file": run_read, "write_file": run_write,
+            "bash": _run_bash, "read_file": _run_read,
+            "write_file": _run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
                                                   "Sent")[1],
             "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
@@ -451,7 +615,6 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
         # Outer loop: WORK → IDLE cycle
         while True:
-            # Identity re-injection (s17)
             if len(messages) <= 3:
                 messages.insert(0, {"role": "user",
                     "content": f"<identity>You are '{name}', role: {role}. "
@@ -473,7 +636,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                     if m.get("type") == "message"]
                     if non_protocol:
                         messages.append({"role": "user",
-                            "content": f"<inbox>{json.dumps(non_protocol)}</inbox>"})
+                            "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>"})
 
                 try:
                     response = client.messages.create(
@@ -497,7 +660,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             if should_shutdown:
                 break
 
-            # IDLE phase (s17 new)
+            # IDLE phase
             idle_result = idle_poll(name, messages, name, role)
             if idle_result == "shutdown":
                 break
@@ -526,7 +689,6 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:
-    """Teammate submits a plan to Lead for approval."""
     req_id = new_request_id()
     pending_requests[req_id] = ProtocolState(
         request_id=req_id, type="plan_approval",
@@ -555,7 +717,6 @@ def run_request_shutdown(teammate: str) -> str:
 
 
 def run_request_plan(teammate: str, task: str) -> str:
-    """Lead asks a teammate to submit a plan."""
     BUS.send("lead", teammate, f"Please submit a plan for: {task}",
              "message")
     return f"Asked {teammate} to submit a plan"
@@ -578,6 +739,20 @@ def run_review_plan(request_id: str, approve: bool,
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
 
+# ── Lead Worktree Tools (s18 new) ──
+
+def run_create_worktree(name: str, task_id: str = "") -> str:
+    return create_worktree(name, task_id)
+
+
+def run_remove_worktree(name: str, discard_changes: bool = False) -> str:
+    return remove_worktree(name, discard_changes)
+
+
+def run_keep_worktree(name: str) -> str:
+    return keep_worktree(name)
+
+
 # ── Basic tool handlers ──
 
 def run_create_task(subject: str, description: str = "",
@@ -594,11 +769,12 @@ def run_list_tasks() -> str:
         return "No tasks."
     return "\n".join(
         f"  {t.id}: {t.subject} [{t.status}]"
+        + (f" (wt:{t.worktree})" if t.worktree else "")
         for t in tasks)
 
 
 def run_get_task(task_id: str) -> str:
-    return get_task(task_id)
+    return get_task_json(task_id)
 
 
 def run_claim_task(task_id: str) -> str:
@@ -616,19 +792,6 @@ def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
 def run_send_message(to: str, content: str) -> str:
     BUS.send("lead", to, content)
     return f"Sent to {to}"
-
-
-def consume_lead_inbox(route_protocol=True) -> list[dict]:
-    """Read Lead inbox: route protocol responses, return all messages."""
-    msgs = BUS.read_inbox("lead")
-    if route_protocol:
-        for msg in msgs:
-            meta = msg.get("metadata", {})
-            req_id = meta.get("request_id", "")
-            msg_type = msg.get("type", "")
-            if req_id and msg_type.endswith("_response"):
-                match_response(msg_type, req_id, meta.get("approve", False))
-    return msgs
 
 
 def run_check_inbox() -> str:
@@ -722,6 +885,24 @@ TOOLS = [
                           "approve": {"type": "boolean"},
                           "feedback": {"type": "string"}},
                       "required": ["request_id", "approve"]}},
+    # s18 new: worktree tools
+    {"name": "create_worktree",
+     "description": "Create an isolated git worktree with its own branch.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"},
+                                     "task_id": {"type": "string"}},
+                      "required": ["name"]}},
+    {"name": "remove_worktree",
+     "description": "Remove a worktree. Refuses if uncommitted changes unless discard_changes=true.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"},
+                                     "discard_changes": {"type": "boolean"}},
+                      "required": ["name"]}},
+    {"name": "keep_worktree",
+     "description": "Keep a worktree for manual review.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"}},
+                      "required": ["name"]}},
 ]
 
 TOOL_HANDLERS = {
@@ -733,6 +914,9 @@ TOOL_HANDLERS = {
     "send_message": run_send_message, "check_inbox": run_check_inbox,
     "request_shutdown": run_request_shutdown,
     "request_plan": run_request_plan, "review_plan": run_review_plan,
+    "create_worktree": run_create_worktree,
+    "remove_worktree": run_remove_worktree,
+    "keep_worktree": run_keep_worktree,
 }
 
 
@@ -783,13 +967,13 @@ def agent_loop(messages: list, context: dict):
 
 
 if __name__ == "__main__":
-    print("s17: autonomous agents")
+    print("s18: worktree isolation")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
     context = {"memories": ""}
     while True:
         try:
-            query = input("\033[36ms17 >> \033[0m")
+            query = input("\033[36ms18 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

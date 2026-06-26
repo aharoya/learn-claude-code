@@ -112,7 +112,7 @@ TOOL_HANDLERS["task"] = spawn_subagent
 
 ```sh
 cd learn-claude-code
-python s06_subagent/code.py
+python s06_subagent/demo_code.py
 ```
 
 以下のプロンプトを試してみよう：

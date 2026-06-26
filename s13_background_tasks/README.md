@@ -197,7 +197,7 @@ Agent 没干等，npm install 跑后台的时候，它去读了配置文件。
 
 ```sh
 cd learn-claude-code
-python s13_background_tasks/code.py
+python s13_background_tasks/demo_code.py
 ```
 
 试试这些 prompt：

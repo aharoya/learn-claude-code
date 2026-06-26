@@ -231,7 +231,7 @@ def schedule_job(cron, prompt, recurring=True, durable=True):
 
 ```sh
 cd learn-claude-code
-python s14_cron_scheduler/code.py
+python s14_cron_scheduler/demo_code.py
 ```
 
 试试这些 prompt：

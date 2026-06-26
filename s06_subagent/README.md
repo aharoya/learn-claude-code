@@ -116,7 +116,7 @@ dispatch 机制不变，task 工具通过 `TOOL_HANDLERS[block.name]` 分发。�
 
 ```sh
 cd learn-claude-code
-python s06_subagent/code.py
+python s06_subagent/demo_code.py
 ```
 
 试试这些 prompt：

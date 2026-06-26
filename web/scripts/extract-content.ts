@@ -50,7 +50,7 @@ function listRootChapters(): ChapterSource[] {
       const id = dirToVersionId(dirName);
       if (!id) return null;
       const dirPath = path.join(REPO_ROOT, dirName);
-      const codePath = path.join(dirPath, "code.py");
+      const codePath = path.join(dirPath, "demo_code.py");
       if (!fs.existsSync(codePath)) return null;
       return { id, dirName, dirPath, codePath };
     })
@@ -214,7 +214,7 @@ function buildRootVersions(chapters: ChapterSource[]): AgentVersion[] {
 
     return {
       id: chapter.id,
-      filename: `${chapter.dirName}/code.py`,
+      filename: `${chapter.dirName}/demo_code.py`,
       title: meta?.title ?? chapter.id,
       subtitle: meta?.subtitle ?? "",
       loc: countLoc(lines),

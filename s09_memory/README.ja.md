@@ -170,7 +170,7 @@ session memory は 1 つのセッション内の連続性を扱う：compact 後
 
 ```sh
 cd learn-claude-code
-python s09_memory/code.py
+python s09_memory/demo_code.py
 ```
 
 以下のプロンプトを試してみてください（複数ターンに分けて入力し、記憶の蓄積と読み込みを観察）：

@@ -120,7 +120,7 @@ The key distinction: skill content is not part of the system prompt. It enters t
 
 ```sh
 cd learn-claude-code
-python s07_skill_loading/code.py
+python s07_skill_loading/demo_code.py
 ```
 
 Try these prompts:

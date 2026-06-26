@@ -168,7 +168,7 @@ The loop is constant. Tools, knowledge, and permissions change. Agent = Model (L
 This repository currently contains two tutorial tracks:
 
 - **Current track: root-level `s01-s20`**
-  The root-level `s01_*` ... `s20_*` folders are the new canonical version. Each chapter contains a full narrative README, translations, runnable `code.py`, and diagrams where needed.
+  The root-level `s01_*` ... `s20_*` folders are the new canonical version. Each chapter contains a full narrative README, translations, runnable `demo_code.py`, and diagrams where needed.
 - **Legacy transition track: `docs/`, `agents/`, and the current `web/` app**
   These still preserve the older 12-lesson version. They are kept temporarily for existing readers, old links, and the web platform while the new 20-lesson track settles.
 
@@ -339,7 +339,7 @@ s08_context_compact/
   README.md              # full narrative with inline code
   README.en.md           # English translation
   README.ja.md           # Japanese translation
-  code.py                # standalone runnable implementation
+  demo_code.py                # standalone runnable implementation
   images/                # SVG diagrams (where needed)
 ```
 
@@ -359,9 +359,9 @@ cd learn-claude-code
 pip install -r requirements.txt
 cp .env.example .env   # configure ANTHROPIC_API_KEY
 
-python s01_agent_loop/code.py        # Start here -- one loop + bash
-python s08_context_compact/code.py   # Context compaction (complex)
-python s20_comprehensive/code.py     # Endpoint: all mechanisms in one loop
+python s01_agent_loop/demo_code.py        # Start here -- one loop + bash
+python s08_context_compact/demo_code.py   # Context compaction (complex)
+python s20_comprehensive/demo_code.py     # Endpoint: all mechanisms in one loop
 ```
 
 ### Legacy 12-Lesson Track
@@ -390,7 +390,7 @@ learn-claude-code/
     README.md              #   Chinese source (complete narrative)
     README.en.md           #   English translation
     README.ja.md           #   Japanese translation
-    code.py                #   standalone runnable code
+    demo_code.py                #   standalone runnable code
     images/                #   SVG diagrams
   s02_tool_use/
   ...

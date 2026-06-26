@@ -44,7 +44,7 @@ Changes from s03:
   - check_permission() removed from loop body
     (logic moved into permission_hook, triggered via PreToolUse)
 
-Run: python s04_hooks/code.py
+Run: python s04_hooks/demo_code.py
 Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
 """
 

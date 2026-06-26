@@ -238,7 +238,7 @@ def agent_loop(messages):
 このリポジトリには現在、2 つのチュートリアルトラックが共存している：
 
 - **現行トラック：ルート直下の `s01-s20`**
-  ルート直下の `s01_*` から `s20_*` までが新しい正規版であり、現在推奨する読書経路。各セッションには中国語原文、英語/日本語訳、実行可能な `code.py`、必要に応じた図が含まれる。
+  ルート直下の `s01_*` から `s20_*` までが新しい正規版であり、現在推奨する読書経路。各セッションには中国語原文、英語/日本語訳、実行可能な `demo_code.py`、必要に応じた図が含まれる。
 - **旧版移行トラック：`docs/`、`agents/`、現在の `web/`**
   これらは旧 12 セッション版を保持している。既存読者、旧リンク、Web プラットフォームのために移行期間中は一時的に残している。
 
@@ -285,9 +285,9 @@ cd learn-claude-code
 pip install -r requirements.txt
 cp .env.example .env   # .env を編集して ANTHROPIC_API_KEY を入力
 
-python s01_agent_loop/code.py        # ここから開始 — 1ループ + bash
-python s08_context_compact/code.py    # コンテキスト圧縮（複雑章）
-python s20_comprehensive/code.py      # 終点: 全メカニズムを 1 つのループへ
+python s01_agent_loop/demo_code.py        # ここから開始 — 1ループ + bash
+python s08_context_compact/demo_code.py    # コンテキスト圧縮（複雑章）
+python s20_comprehensive/demo_code.py      # 終点: 全メカニズムを 1 つのループへ
 ```
 
 ### 旧 12 セッション移行版
@@ -386,7 +386,7 @@ learn-claude-code/
     README.md              #   中国語ソース（完全なナラティブ）
     README.en.md           #   英語訳
     README.ja.md           #   日本語訳
-    code.py                #   単体実行可能なコード
+    demo_code.py                #   単体実行可能なコード
     images/                #   SVG ダイアグラム
   s02_tool_use/
   ...

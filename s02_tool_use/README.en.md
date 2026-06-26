@@ -136,7 +136,7 @@ The teaching version executes them one by one in the original `response.content`
 
 ```sh
 cd learn-claude-code
-python s02_tool_use/code.py
+python s02_tool_use/demo_code.py
 ```
 
 Try these prompts:

@@ -201,7 +201,7 @@ for block in response.content:
 
 ```sh
 cd learn-claude-code
-python s04_hooks/code.py
+python s04_hooks/demo_code.py
 ```
 
 试试这些 prompt：

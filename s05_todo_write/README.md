@@ -113,7 +113,7 @@ Agent 收到任务后的典型流程：先调 `todo_write` 列出所有步骤（
 
 ```sh
 cd learn-claude-code
-python s05_todo_write/code.py
+python s05_todo_write/demo_code.py
 ```
 
 试试这些 prompt：

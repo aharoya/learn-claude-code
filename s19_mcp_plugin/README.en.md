@@ -159,7 +159,7 @@ This is a teaching simplification. In real CC, MCP tools are available to both t
 
 ```sh
 cd learn-claude-code
-python s19_mcp_plugin/code.py
+python s19_mcp_plugin/demo_code.py
 ```
 
 Try these prompts:

@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
 """
-s15: Agent Teams — MessageBus + spawn_teammate_thread + inbox injection.
+s16: Team Protocols — request-response protocol + request_id + dispatch + state machine.
 
-Run:  python s15_agent_teams/code.py
+Run:  python s16_team_protocols/demo_code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
-Changes from s14:
-  - MessageBus class: file-based mailboxes (.mailboxes/*.jsonl)
-  - spawn_teammate_thread: creates teammate in background thread
-  - Teammate runs own simplified agent_loop (bash, read, write, send_message)
-  - Lead tools: spawn_teammate, send_message, check_inbox (3 new)
-  - Lead inbox: teammate messages injected into history (not just printed)
-  - Teaching version: teammates limited to 10 rounds (real CC uses idle loop)
+Changes from s15:
+  - ProtocolState dataclass (request_id, type, sender, status, created_at)
+  - pending_requests dict: tracks in-flight protocol requests
+  - dispatch_message: routes incoming messages by type to handlers
+  - request_shutdown: Lead sends shutdown protocol request
+  - request_plan: Lead asks teammate to submit plan
+  - handle_shutdown_request / handle_plan_response: teammate receives & responds
+  - match_response: Lead correlates response to request via request_id (with type validation)
+  - Teammate idle loop: waits for inbox messages instead of exiting after 10 rounds
+  - Unified consume_lead_inbox: protocol routing + injection into history
+  - 3 new Lead tools: request_shutdown, request_plan, review_plan
+  - 1 new teammate tool: submit_plan
 
 ASCII flow:
-  Lead: cron_queue → messages → prompt → LLM → TOOLS ────→ loop
-                ↑                     ↓                        |
-                └── inbox ← MessageBus ← teammate.send_message ←┘
-  Teammate: inbox → LLM → bash/read/write/send → loop (max 10 turns)
+  Lead: BUS.send("shutdown_request", {request_id}) ──────→ teammate inbox
+  Teammate: dispatch → handler → BUS.send("shutdown_response", {request_id}) ─→ Lead inbox
+  Lead: consume_lead_inbox → match_response(request_id) → pending_requests[req_id].status = approved
 """
 
 import os, subprocess, json, time, random, threading
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 try:
     import readline
@@ -144,8 +148,8 @@ PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
     "tools": "Available tools: bash, read_file, write_file, "
              "get_task, create_task, list_tasks, claim_task, complete_task, "
-             "schedule_cron, list_crons, cancel_cron, "
-             "spawn_teammate, send_message, check_inbox.",
+             "spawn_teammate, send_message, check_inbox, "
+             "request_shutdown, request_plan, review_plan.",
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
 }
@@ -280,23 +284,6 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
     return is_slow_operation(tool_name, tool_input)
 
 
-def execute_tool(block) -> str:
-    """Execute a tool call block, return output."""
-    handler = {
-        "bash": run_bash, "read_file": run_read, "write_file": run_write,
-        "create_task": run_create_task, "list_tasks": run_list_tasks,
-        "get_task": run_get_task, "claim_task": run_claim_task,
-        "complete_task": run_complete_task,
-        "schedule_cron": run_schedule_cron, "list_crons": run_list_crons,
-        "cancel_cron": run_cancel_cron,
-        "spawn_teammate": run_spawn_teammate,
-        "send_message": run_send_message, "check_inbox": run_check_inbox,
-    }.get(block.name)
-    if handler:
-        return handler(**block.input)
-    return f"Unknown tool: {block.name}"
-
-
 def start_background_task(block) -> str:
     """Run tool in a daemon thread. Returns background task ID."""
     global _bg_counter
@@ -344,249 +331,7 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
-# ── Cron Scheduler (from s14, synced) ──
-
-DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
-
-
-@dataclass
-class CronJob:
-    id: str
-    cron: str        # "0 9 * * *"
-    prompt: str      # message to inject when fired
-    recurring: bool  # True = recurring, False = one-shot
-    durable: bool    # True = persist to disk
-
-
-scheduled_jobs: dict[str, CronJob] = {}
-cron_queue: list[CronJob] = []
-cron_lock = threading.Lock()
-_last_fired: dict[str, str] = {}  # job_id → "YYYY-MM-DD HH:MM"
-
-
-def _cron_field_matches(field: str, value: int) -> bool:
-    """Match a single cron field against a value."""
-    if field == "*":
-        return True
-    if field.startswith("*/"):
-        step = int(field[2:])
-        return step > 0 and value % step == 0
-    if "," in field:
-        return any(_cron_field_matches(f.strip(), value)
-                   for f in field.split(","))
-    if "-" in field:
-        lo, hi = field.split("-", 1)
-        return int(lo) <= value <= int(hi)
-    return value == int(field)
-
-
-def cron_matches(cron_expr: str, dt: datetime) -> bool:
-    """Check if a 5-field cron expression matches the given datetime.
-    Standard cron semantics: DOM and DOW use OR when both are constrained."""
-    fields = cron_expr.strip().split()
-    if len(fields) != 5:
-        return False
-    minute, hour, dom, month, dow = fields
-    dow_val = (dt.weekday() + 1) % 7  # Python Monday=0 → cron Sunday=0
-
-    m = _cron_field_matches(minute, dt.minute)
-    h = _cron_field_matches(hour, dt.hour)
-    dom_ok = _cron_field_matches(dom, dt.day)
-    month_ok = _cron_field_matches(month, dt.month)
-    dow_ok = _cron_field_matches(dow, dow_val)
-
-    # Minute, hour, month must all match
-    if not (m and h and month_ok):
-        return False
-    # DOM and DOW: if both constrained, either matching is enough (OR)
-    dom_unconstrained = dom == "*"
-    dow_unconstrained = dow == "*"
-    if dom_unconstrained and dow_unconstrained:
-        return True
-    if dom_unconstrained:
-        return dow_ok
-    if dow_unconstrained:
-        return dom_ok
-    return dom_ok or dow_ok
-
-
-def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
-    """Validate a single cron field value is within [lo, hi]."""
-    if field == "*":
-        return None
-    if field.startswith("*/"):
-        step_str = field[2:]
-        if not step_str.isdigit():
-            return f"Invalid step: {field}"
-        step = int(step_str)
-        if step <= 0:
-            return f"Step must be > 0: {field}"
-        return None
-    if "," in field:
-        for part in field.split(","):
-            err = _validate_cron_field(part.strip(), lo, hi)
-            if err: return err
-        return None
-    if "-" in field:
-        parts = field.split("-", 1)
-        if not parts[0].isdigit() or not parts[1].isdigit():
-            return f"Invalid range: {field}"
-        a, b = int(parts[0]), int(parts[1])
-        if a < lo or a > hi or b < lo or b > hi:
-            return f"Range {field} out of bounds [{lo}-{hi}]"
-        if a > b:
-            return f"Range start > end: {field}"
-        return None
-    if not field.isdigit():
-        return f"Invalid field: {field}"
-    val = int(field)
-    if val < lo or val > hi:
-        return f"Value {val} out of bounds [{lo}-{hi}]"
-    return None
-
-
-def validate_cron(cron_expr: str) -> str | None:
-    """Validate a cron expression. Returns error message or None."""
-    fields = cron_expr.strip().split()
-    if len(fields) != 5:
-        return f"Expected 5 fields, got {len(fields)}"
-    bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
-    names = ["minute", "hour", "day-of-month", "month", "day-of-week"]
-    for i, (field, (lo, hi), name) in enumerate(zip(fields, bounds, names)):
-        err = _validate_cron_field(field, lo, hi)
-        if err:
-            return f"{name}: {err}"
-    return None
-
-
-def save_durable_jobs():
-    """Persist durable jobs to .scheduled_tasks.json."""
-    durable = [asdict(j) for j in scheduled_jobs.values() if j.durable]
-    DURABLE_PATH.write_text(json.dumps(durable, indent=2))
-
-
-def load_durable_jobs():
-    """Load durable jobs from disk on startup."""
-    if not DURABLE_PATH.exists():
-        return
-    try:
-        jobs = json.loads(DURABLE_PATH.read_text())
-        for j in jobs:
-            job = CronJob(**j)
-            err = validate_cron(job.cron)
-            if err:
-                print(f"  \033[31m[cron] skipping invalid job {job.id}: {err}\033[0m")
-                continue
-            scheduled_jobs[job.id] = job
-        valid = [j for j in jobs if j["id"] in scheduled_jobs]
-        if valid:
-            print(f"  \033[35m[cron] loaded {len(valid)} durable job(s)\033[0m")
-    except Exception:
-        pass
-
-
-def schedule_job(cron: str, prompt: str, recurring: bool = True,
-                 durable: bool = True) -> CronJob | str:
-    """Register a new cron job. Returns CronJob or error string."""
-    err = validate_cron(cron)
-    if err:
-        return err
-    job = CronJob(
-        id=f"cron_{random.randint(0, 999999):06d}",
-        cron=cron, prompt=prompt,
-        recurring=recurring, durable=durable,
-    )
-    with cron_lock:
-        scheduled_jobs[job.id] = job
-    if durable:
-        save_durable_jobs()
-    print(f"  \033[35m[cron register] {job.id} '{cron}' → {prompt[:40]}\033[0m")
-    return job
-
-
-def cancel_job(job_id: str) -> str:
-    """Cancel a cron job."""
-    with cron_lock:
-        job = scheduled_jobs.pop(job_id, None)
-    if not job:
-        return f"Job {job_id} not found"
-    if job.durable:
-        save_durable_jobs()
-    print(f"  \033[31m[cron cancel] {job_id}\033[0m")
-    return f"Cancelled {job_id}"
-
-
-def cron_scheduler_loop():
-    """Independent daemon thread: poll every 1s, fire matching jobs.
-    Individual job errors are caught to prevent one bad job from
-    killing the entire scheduler thread."""
-    while True:
-        time.sleep(1)
-        now = datetime.now()
-        # Date-aware marker prevents daily jobs from skipping on day 2+
-        minute_marker = now.strftime("%Y-%m-%d %H:%M")
-        with cron_lock:
-            for job in list(scheduled_jobs.values()):
-                try:
-                    if cron_matches(job.cron, now):
-                        if _last_fired.get(job.id) != minute_marker:
-                            cron_queue.append(job)
-                            _last_fired[job.id] = minute_marker
-                            print(f"  \033[35m[cron fire] {job.id} → "
-                                  f"{job.prompt[:40]}\033[0m")
-                        if not job.recurring:
-                            scheduled_jobs.pop(job.id, None)
-                            if job.durable:
-                                save_durable_jobs()
-                except Exception as e:
-                    print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
-
-
-def consume_cron_queue() -> list[CronJob]:
-    """Consume fired jobs from cron_queue (called by agent_loop)."""
-    with cron_lock:
-        fired = list(cron_queue)
-        cron_queue.clear()
-    return fired
-
-
-# Load durable jobs on startup, then start scheduler thread
-load_durable_jobs()
-threading.Thread(target=cron_scheduler_loop, daemon=True).start()
-print("  \033[35m[cron] scheduler thread started\033[0m")
-
-
-# Cron tool handlers
-
-def run_schedule_cron(cron: str, prompt: str,
-                      recurring: bool = True, durable: bool = True) -> str:
-    result = schedule_job(cron, prompt, recurring, durable)
-    if isinstance(result, str):
-        return f"Error: {result}"
-    return f"Scheduled {result.id}: '{cron}' → {prompt}"
-
-
-def run_list_crons() -> str:
-    with cron_lock:
-        jobs = list(scheduled_jobs.values())
-    if not jobs:
-        return "No cron jobs. Use schedule_cron to add one."
-    lines = []
-    for j in jobs:
-        tag = "recurring" if j.recurring else "one-shot"
-        dur = "durable" if j.durable else "session"
-        lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
-                     f"[{tag}, {dur}]")
-    return "\n".join(lines)
-
-
-def run_cancel_cron(job_id: str) -> str:
-    return cancel_job(job_id)
-
-
-# ── MessageBus (s15 new) ──
-# Teaching version uses simple file append + unlink.
-# Real CC uses proper-lockfile for concurrent write safety.
+# ── MessageBus (from s15) ──
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
@@ -598,15 +343,15 @@ class MessageBus:
     Teaching version: no file locking; real CC uses proper-lockfile."""
 
     def send(self, from_agent: str, to_agent: str, content: str,
-             msg_type: str = "message"):
+             msg_type: str = "message", metadata: dict = None):
         msg = {"from": from_agent, "to": to_agent,
                "content": content, "type": msg_type,
-               "ts": time.time()}
+               "ts": time.time(), "metadata": metadata or {}}
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
         with open(inbox, "a") as f:
             f.write(json.dumps(msg) + "\n")
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
-              f"{content[:50]}\033[0m")
+              f"({msg_type}) {content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
@@ -619,24 +364,115 @@ class MessageBus:
 
 
 BUS = MessageBus()
-
-# Track spawned teammates
 active_teammates: dict[str, bool] = {}
 
+# ── Protocol State (s16 new) ──
 
-# ── Teammate Thread (s15 new) ──
+@dataclass
+class ProtocolState:
+    request_id: str
+    type: str       # "shutdown" | "plan_approval"
+    sender: str
+    target: str
+    status: str     # pending | approved | rejected
+    payload: str    # plan text or shutdown reason
+    created_at: float = field(default_factory=time.time)
+
+
+pending_requests: dict[str, ProtocolState] = {}
+
+
+def new_request_id() -> str:
+    return f"req_{random.randint(0, 999999):06d}"
+
+
+def match_response(response_type: str, request_id: str, approve: bool):
+    """Correlate a response to the original request via request_id.
+    Validates that response_type matches the request type."""
+    state = pending_requests.get(request_id)
+    if not state:
+        print(f"  \033[31m[protocol] unknown request_id: {request_id}\033[0m")
+        return
+    # Validate response type matches request type
+    if state.type == "shutdown" and response_type != "shutdown_response":
+        print(f"  \033[31m[protocol] type mismatch: expected shutdown_response, "
+              f"got {response_type}\033[0m")
+        return
+    if state.type == "plan_approval" and response_type != "plan_approval_response":
+        print(f"  \033[31m[protocol] type mismatch: expected plan_approval_response, "
+              f"got {response_type}\033[0m")
+        return
+    if state.status != "pending":
+        print(f"  \033[33m[protocol] {request_id} already {state.status}, "
+              f"ignoring duplicate\033[0m")
+        return
+    state.status = "approved" if approve else "rejected"
+    icon = "✓" if approve else "✗"
+    color = "32" if approve else "31"
+    print(f"  \033[{color}m[protocol] {state.type} {icon} "
+          f"({request_id}: {state.status})\033[0m")
+
+
+# ── Unified Lead Inbox Consumer (s16 fix) ──
+# Both check_inbox tool and main loop call this function.
+# Protocol responses are routed via match_response before returning.
+
+def consume_lead_inbox(route_protocol: bool = True) -> list[dict]:
+    """Read Lead's inbox. Route protocol responses, return all messages.
+    Called by both run_check_inbox() and main loop to avoid
+    messages being consumed without protocol routing."""
+    msgs = BUS.read_inbox("lead")
+    if not msgs:
+        return []
+    if route_protocol:
+        for msg in msgs:
+            meta = msg.get("metadata", {})
+            req_id = meta.get("request_id", "")
+            msg_type = msg.get("type", "")
+            if req_id and msg_type.endswith("_response"):
+                approve = meta.get("approve", False)
+                match_response(msg_type, req_id, approve)
+    return msgs
+
+
+# ── Teammate Thread (s16: idle loop + dispatch) ──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     """Spawn a teammate agent in a background thread.
-    Teaching version: max 10 rounds per teammate.
-    Real CC: teammates use idle loop (wait for inbox, work, repeat)
-    until shutdown_request."""
+    Uses idle loop: after each LLM turn, waits for inbox messages
+    (shutdown_request, new task) instead of exiting."""
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
 
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
-              f"Send results via send_message to 'lead'.")
+              f"Check inbox for protocol messages (shutdown_request, etc).")
+
+    def handle_inbox_message(name: str, msg: dict, messages: list) -> bool:
+        """Dispatch incoming protocol messages by type.
+        Returns True if teammate should stop."""
+        msg_type = msg.get("type", "message")
+        meta = msg.get("metadata", {})
+        req_id = meta.get("request_id", "")
+
+        if msg_type == "shutdown_request":
+            BUS.send(name, "lead", "Shutting down gracefully.",
+                     "shutdown_response",
+                     {"request_id": req_id, "approve": True})
+            print(f"  \033[35m[protocol] {name} approved shutdown "
+                  f"({req_id})\033[0m")
+            return True  # stop the loop
+
+        if msg_type == "plan_approval_response":
+            approve = meta.get("approve", False)
+            if approve:
+                messages.append({"role": "user",
+                    "content": f"[Plan approved] Proceed with the task."})
+            else:
+                messages.append({"role": "user",
+                    "content": f"[Plan rejected] Feedback: {msg['content']}"})
+
+        return False  # continue
 
     def run():
         messages = [{"role": "user", "content": prompt}]
@@ -645,42 +481,89 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
              "input_schema": {"type": "object",
                               "properties": {"command": {"type": "string"}},
                               "required": ["command"]}},
-            {"name": "read_file", "description": "Read file contents.",
+            {"name": "read_file", "description": "Read file.",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"}},
                               "required": ["path"]}},
-            {"name": "write_file", "description": "Write content to a file.",
+            {"name": "write_file", "description": "Write file.",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["path", "content"]}},
             {"name": "send_message",
-             "description": "Send a message to another agent.",
+             "description": "Send message to another agent.",
              "input_schema": {"type": "object",
                               "properties": {"to": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["to", "content"]}},
+            {"name": "submit_plan",
+             "description": "Submit a plan for Lead approval.",
+             "input_schema": {"type": "object",
+                              "properties": {"plan": {"type": "string"}},
+                              "required": ["plan"]}},
         ]
         sub_handlers = {
             "bash": run_bash, "read_file": run_read, "write_file": run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
                                                   "Sent")[1],
+            "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
         }
 
-        for _ in range(10):
+        shutdown_requested = False
+        while not shutdown_requested:
+            # Check inbox for protocol messages
             inbox = BUS.read_inbox(name)
-            if inbox:
+            should_stop = False
+            non_protocol = []
+            for msg in inbox:
+                if msg.get("type") in ("shutdown_request", "plan_approval_response"):
+                    should_stop = handle_inbox_message(name, msg, messages)
+                    if should_stop:
+                        break
+                else:
+                    non_protocol.append(msg)
+            if should_stop:
+                shutdown_requested = True
+                break
+            if non_protocol:
+                inbox_json = json.dumps(non_protocol)
                 messages.append({"role": "user",
-                                 "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
+                    "content": "<inbox>" + inbox_json + "</inbox>"})
+
+            # LLM turn
             try:
                 response = client.messages.create(
                     model=MODEL, system=system, messages=messages[-20:],
                     tools=sub_tools, max_tokens=8000)
             except Exception:
                 break
+
             messages.append({"role": "assistant", "content": response.content})
             if response.stop_reason != "tool_use":
-                break
+                # Idle: wait for inbox messages instead of exiting
+                # Real CC sends idle_notification to Lead here
+                while not shutdown_requested:
+                    time.sleep(1)
+                    inbox = BUS.read_inbox(name)
+                    if not inbox:
+                        continue
+                    for msg in inbox:
+                        if msg.get("type") in ("shutdown_request", "plan_approval_response"):
+                            should_stop = handle_inbox_message(name, msg, messages)
+                            if should_stop:
+                                shutdown_requested = True
+                                break
+                        else:
+                            non_protocol.append(msg)
+                    if shutdown_requested:
+                        break
+                    if non_protocol:
+                        inbox_json = json.dumps(non_protocol)
+                        messages.append({"role": "user",
+                            "content": "<inbox>" + inbox_json + "</inbox>"})
+                        break  # back to LLM turn with new messages
+
+            # Execute tool calls
             results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -712,7 +595,66 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     return f"Teammate '{name}' spawned as {role}"
 
 
-# ── Team Tool Handlers (s15 new) ──
+def _teammate_submit_plan(from_name: str, plan: str) -> str:
+    """Teammate submits a plan to Lead for approval.
+
+    Note: This is a protocol-level request, not a code-level gate.
+    After submitting, the teammate's thread continues running — it can
+    still call bash/write/etc. Real enforcement relies on the model
+    waiting for the approval response before acting. Code-level tool
+    gating would require blocking the teammate's tool dispatch until
+    approval arrives.
+    """
+    req_id = new_request_id()
+    pending_requests[req_id] = ProtocolState(
+        request_id=req_id, type="plan_approval",
+        sender=from_name, target="lead",
+        status="pending", payload=plan)
+    BUS.send(from_name, "lead", plan,
+             "plan_approval_request",
+             {"request_id": req_id})
+    return f"Plan submitted ({req_id}). Waiting for approval..."
+
+
+# ── Lead Protocol Tools (s16 new) ──
+
+def run_request_shutdown(teammate: str) -> str:
+    req_id = new_request_id()
+    pending_requests[req_id] = ProtocolState(
+        request_id=req_id, type="shutdown",
+        sender="lead", target=teammate,
+        status="pending", payload="")
+    BUS.send("lead", teammate, "Please shut down gracefully.",
+             "shutdown_request",
+             {"request_id": req_id})
+    print(f"  \033[35m[protocol] shutdown_request → {teammate} "
+          f"({req_id})\033[0m")
+    return f"Shutdown request sent to {teammate} (req: {req_id})"
+
+
+def run_request_plan(teammate: str, task: str) -> str:
+    """Lead asks a teammate to submit a plan for a task."""
+    BUS.send("lead", teammate, f"Please submit a plan for: {task}",
+             "message")
+    return f"Asked {teammate} to submit a plan"
+
+
+def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
+    state = pending_requests.get(request_id)
+    if not state:
+        return f"Request {request_id} not found"
+    if state.status != "pending":
+        return f"Request {request_id} already {state.status}"
+    state.status = "approved" if approve else "rejected"
+    BUS.send("lead", state.sender, feedback or ("Approved" if approve else "Rejected"),
+             "plan_approval_response",
+             {"request_id": request_id, "approve": approve})
+    icon = "✓" if approve else "✗"
+    print(f"  \033[32m[protocol] plan {icon} ({request_id})\033[0m")
+    return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
+
+
+# ── Other Lead Tool Handlers ──
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)
@@ -724,13 +666,36 @@ def run_send_message(to: str, content: str) -> str:
 
 
 def run_check_inbox() -> str:
-    msgs = BUS.read_inbox("lead")
+    """Check Lead's inbox. Routes protocol responses via match_response."""
+    msgs = consume_lead_inbox(route_protocol=True)
     if not msgs:
         return "(inbox empty)"
     lines = []
     for m in msgs:
-        lines.append(f"  [{m['from']}] {m['content'][:200]}")
+        meta = m.get("metadata", {})
+        req_id = meta.get("request_id", "")
+        tag = f" [{m['type']} req:{req_id}]" if req_id else f" [{m['type']}]"
+        lines.append(f"  [{m['from']}]{tag} {m['content'][:200]}")
     return "\n".join(lines)
+
+
+# ── Tool Dispatch ──
+
+def execute_tool(block) -> str:
+    """Execute a tool call block, return output."""
+    handler = {
+        "bash": run_bash, "read_file": run_read, "write_file": run_write,
+        "create_task": run_create_task, "list_tasks": run_list_tasks,
+        "get_task": run_get_task, "claim_task": run_claim_task,
+        "complete_task": run_complete_task,
+        "spawn_teammate": run_spawn_teammate,
+        "send_message": run_send_message, "check_inbox": run_check_inbox,
+        "request_shutdown": run_request_shutdown,
+        "request_plan": run_request_plan, "review_plan": run_review_plan,
+    }.get(block.name)
+    if handler:
+        return handler(**block.input)
+    return f"Unknown tool: {block.name}"
 
 
 # ── Tool Definitions ──
@@ -780,28 +745,6 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "schedule_cron",
-     "description": "Schedule a cron job. cron is 5-field: min hour dom month dow.",
-     "input_schema": {"type": "object",
-                      "properties": {
-                          "cron": {"type": "string",
-                                   "description": "5-field cron expression"},
-                          "prompt": {"type": "string",
-                                     "description": "Message to inject when fired"},
-                          "recurring": {"type": "boolean",
-                                        "description": "True=recurring, False=one-shot"},
-                          "durable": {"type": "boolean",
-                                      "description": "True=persist to disk"}},
-                      "required": ["cron", "prompt"]}},
-    {"name": "list_crons",
-     "description": "List all registered cron jobs.",
-     "input_schema": {"type": "object", "properties": {},
-                      "required": []}},
-    {"name": "cancel_cron",
-     "description": "Cancel a cron job by ID.",
-     "input_schema": {"type": "object",
-                      "properties": {"job_id": {"type": "string"}},
-                      "required": ["job_id"]}},
     {"name": "spawn_teammate",
      "description": "Spawn a teammate agent in a background thread.",
      "input_schema": {"type": "object",
@@ -811,15 +754,34 @@ TOOLS = [
                           "prompt": {"type": "string"}},
                       "required": ["name", "role", "prompt"]}},
     {"name": "send_message",
-     "description": "Send a message to a teammate via MessageBus.",
+     "description": "Send message to a teammate via MessageBus.",
      "input_schema": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["to", "content"]}},
     {"name": "check_inbox",
-     "description": "Check Lead's inbox for teammate messages.",
+     "description": "Check Lead's inbox. Routes protocol responses automatically.",
      "input_schema": {"type": "object", "properties": {},
                       "required": []}},
+    {"name": "request_shutdown",
+     "description": "Request a teammate to shut down gracefully.",
+     "input_schema": {"type": "object",
+                      "properties": {"teammate": {"type": "string"}},
+                      "required": ["teammate"]}},
+    {"name": "request_plan",
+     "description": "Ask a teammate to submit a plan for review.",
+     "input_schema": {"type": "object",
+                      "properties": {"teammate": {"type": "string"},
+                                     "task": {"type": "string"}},
+                      "required": ["teammate", "task"]}},
+    {"name": "review_plan",
+     "description": "Approve or reject a submitted plan by request_id.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "request_id": {"type": "string"},
+                          "approve": {"type": "boolean"},
+                          "feedback": {"type": "string"}},
+                      "required": ["request_id", "approve"]}},
 ]
 
 
@@ -840,20 +802,10 @@ def update_context(context: dict, messages: list) -> dict:
 
 
 # ── Agent Loop ──
-# Teaching code keeps a basic agent loop. S11's full error recovery is omitted.
-# Cron queue is consumed when agent_loop is called; real CC auto-wakes via
-# queue processor (useQueueProcessor.ts) when items arrive.
 
 def agent_loop(messages: list, context: dict):
     system = get_system_prompt(context)
     while True:
-        # Consume fired cron jobs → inject as messages
-        fired = consume_cron_queue()
-        for job in fired:
-            messages.append({"role": "user",
-                             "content": f"[Scheduled] {job.prompt}"})
-            print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
-
         try:
             response = client.messages.create(
                 model=MODEL, system=system, messages=messages,
@@ -899,13 +851,13 @@ def agent_loop(messages: list, context: dict):
 
 
 if __name__ == "__main__":
-    print("s15: agent teams")
+    print("s16: team protocols")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
     context = update_context({}, [])
     while True:
         try:
-            query = input("\033[36ms15 >> \033[0m")
+            query = input("\033[36ms16 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -917,12 +869,12 @@ if __name__ == "__main__":
             if getattr(block, "type", None) == "text":
                 print(block.text)
 
-        # Check inbox for teammate results → inject into history
-        inbox = BUS.read_inbox("lead")
-        if inbox:
+        # Check inbox → route protocol + inject into history
+        inbox_msgs = consume_lead_inbox(route_protocol=True)
+        if inbox_msgs:
             inbox_text = "\n".join(
-                f"From {m['from']}: {m['content'][:200]}" for m in inbox)
+                f"From {m['from']}: {m['content'][:200]}" for m in inbox_msgs)
             history.append({"role": "user",
                             "content": f"[Inbox]\n{inbox_text}"})
-            print(f"\n\033[33m[Inbox: {len(inbox)} messages injected]\033[0m")
+            print(f"\n\033[33m[Inbox: {len(inbox_msgs)} messages injected]\033[0m")
         print()

@@ -28,7 +28,7 @@ Execution order matches CC source: budget → snip → micro → auto.
 
 Builds on s07 (skill loading). Usage:
 
-    python s08_context_compact/code.py
+    python s08_context_compact/demo_code.py
     Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
 """
 

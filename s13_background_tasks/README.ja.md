@@ -197,7 +197,7 @@ Agent は待たなかった。npm install がバックグラウンドで実行�
 
 ```sh
 cd learn-claude-code
-python s13_background_tasks/code.py
+python s13_background_tasks/demo_code.py
 ```
 
 以下のプロンプトを試してください：

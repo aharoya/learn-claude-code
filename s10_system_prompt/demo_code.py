@@ -2,7 +2,7 @@
 """
 s10: System Prompt — Runtime prompt assembly with caching.
 
-Run:  python s10_system_prompt/code.py
+Run:  python s10_system_prompt/demo_code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
 Changes from s09:

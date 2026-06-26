@@ -207,12 +207,12 @@ def agent_loop(messages):
 
 ```sh
 cd learn-claude-code
-python s08_context_compact/code.py
+python s08_context_compact/demo_code.py
 ```
 
 Try these prompts:
 
-1. `Read the file README.md, then read code.py, then read s01_agent_loop/README.md` (read multiple files consecutively, observe L2 compressing old results)
+1. `Read the file README.md, then read demo_code.py, then read s01_agent_loop/README.md` (read multiple files consecutively, observe L2 compressing old results)
 2. `Read every file in s08_context_compact/` (read a large amount of content at once, observe L3 persisting to disk)
 3. Chat for 20+ turns, observe whether `[auto compact]` or `[reactive compact]` appears
 

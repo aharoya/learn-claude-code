@@ -2,7 +2,7 @@
 """
 s11: Error Recovery — three recovery paths + exponential backoff.
 
-Run:  python s11_error_recovery/code.py
+Run:  python s11_error_recovery/demo_code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
 Changes from s10:

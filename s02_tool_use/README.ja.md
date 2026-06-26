@@ -136,7 +136,7 @@ for block in response.content:
 
 ```sh
 cd learn-claude-code
-python s02_tool_use/code.py
+python s02_tool_use/demo_code.py
 ```
 
 以下のプロンプトを試してみよう：

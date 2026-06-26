@@ -75,7 +75,7 @@ loop 自体は同じ構造のままだ。model を呼び、response に `tool_us
 
 ---
 
-## code.py に含まれるもの
+## demo_code.py に含まれるもの
 
 ### Tools と Dispatch
 
@@ -209,7 +209,7 @@ MCP は external capability を担当する：
 
 ```sh
 cd learn-claude-code
-python s20_comprehensive/code.py
+python s20_comprehensive/demo_code.py
 ```
 
 試す prompt：

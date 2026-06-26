@@ -126,7 +126,7 @@ cp .env.example .env
 **実行**：
 
 ```sh
-python s01_agent_loop/code.py
+python s01_agent_loop/demo_code.py
 ```
 
 以下のプロンプトを試してみよう：

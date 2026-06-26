@@ -18,7 +18,7 @@ pip install -r requirements.txt
 cp .env.example .env
 
 # 运行任一章节的独立实现
-python s01_agent_loop/code.py
+python s01_agent_loop/demo_code.py
 
 # 运行全量测试（需先 pip install pytest）
 python -m pytest tests -q
@@ -41,7 +41,7 @@ cd web && npx tsc --noEmit
 │   ├── README.md            #   中文教程文档（主源文档）
 │   ├── README.en.md         #   英文翻译
 │   ├── README.ja.md         #   日文翻译
-│   ├── code.py              #   独立可运行的实现
+│   ├── demo_code.py              #   独立可运行的实现
 │   └── images/              #   SVG 图解
 ├── s02_tool_use/            # 第 2 章 - 工具分发
 ├── s03_permission/          # 第 3 章 - 权限门
@@ -77,7 +77,7 @@ cd web && npx tsc --noEmit
 | **并发与调度** | s13-s14 | 后台任务（线程池）、Cron 定时器 |
 | **多 Agent 平台** | s12, s15-s20 | 任务系统、团队协作、协议、自治认领、工作树隔离、MCP、综合 |
 
-所有章节共享同一个不可变的核心循环（来自 `s01_agent_loop/code.py`）：
+所有章节共享同一个不可变的核心循环（来自 `s01_agent_loop/demo_code.py`）：
 
 ```python
 def agent_loop(messages):
@@ -95,9 +95,9 @@ def agent_loop(messages):
 
 ## 架构关键模式
 
-- **`code.py` 是独立可运行的**：每个章节的 `code.py` 可直接 `python code.py` 启动，无需跨章节依赖（但 s20 整合了所有前序机制）。
+- **`demo_code.py` 是独立可运行的**：每个章节的 `demo_code.py` 可直接 `python demo_code.py` 启动，无需跨章节依赖（但 s20 整合了所有前序机制）。
 - **测试使用 `importlib` 动态加载**：`tests/` 中的测试通过 `importlib` 导入各章节代码，并注入 `unittest.mock` 替换 `anthropic`/`dotenv`/`yaml`，使其无需真实 API Key 即可运行。
-- **旧版 `agents/` 保持同步**：旧版 12 课文件（`agents/s01_agent_loop.py` 等）应保持与新版 `s01/`-`s20/` 中对应章节的 `code.py` 逻辑一致（见本文档末尾的章节对照表）。
+- **旧版 `agents/` 保持同步**：旧版 12 课文件（`agents/s01_agent_loop.py` 等）应保持与新版 `s01/`-`s20/` 中对应章节的 `demo_code.py` 逻辑一致（见本文档末尾的章节对照表）。
 - **三语维护**：每个章节的 `README.md`（中文）是源文档，`README.en.md` 和 `README.ja.md` 是翻译，需保持同步更新。
 
 ## 环境变量

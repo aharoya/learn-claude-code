@@ -2,7 +2,7 @@
 """
 s13: Background Tasks — thread-based async execution + notification injection.
 
-Run:  python s13_background_tasks/code.py
+Run:  python s13_background_tasks/demo_code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
 Changes from s12:

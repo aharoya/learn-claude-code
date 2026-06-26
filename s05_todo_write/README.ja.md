@@ -113,7 +113,7 @@ Agent がタスクを受け取った後の典型的な流れ：まず `todo_writ
 
 ```sh
 cd learn-claude-code
-python s05_todo_write/code.py
+python s05_todo_write/demo_code.py
 ```
 
 以下のプロンプトを試してみよう：

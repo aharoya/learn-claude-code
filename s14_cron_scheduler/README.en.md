@@ -231,7 +231,7 @@ Loading durable jobs from disk also skips invalid expressions, preventing a sing
 
 ```sh
 cd learn-claude-code
-python s14_cron_scheduler/code.py
+python s14_cron_scheduler/demo_code.py
 ```
 
 Try these prompts:

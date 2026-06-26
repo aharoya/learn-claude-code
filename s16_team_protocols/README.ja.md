@@ -201,7 +201,7 @@ LLM が非 tool_use を返す
 
 ```sh
 cd learn-claude-code
-python s16_team_protocols/code.py
+python s16_team_protocols/demo_code.py
 ```
 
 以下のプロンプトを試してください：

@@ -205,7 +205,7 @@ complete_task(tests.id)     # ✓ Completed
 
 ```sh
 cd learn-claude-code
-python s12_task_system/code.py
+python s12_task_system/demo_code.py
 ```
 
 试试这些 prompt：

@@ -75,7 +75,7 @@ S20 不是再发明一个新机制，而是把前面的教学组件合成一个�
 
 ---
 
-## code.py 包含什么
+## demo_code.py 包含什么
 
 ### 工具与分发
 
@@ -209,7 +209,7 @@ MCP 负责外部能力：
 
 ```sh
 cd learn-claude-code
-python s20_comprehensive/code.py
+python s20_comprehensive/demo_code.py
 ```
 
 可以试：

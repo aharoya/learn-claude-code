@@ -75,7 +75,7 @@ The loop is still the same structure: call the model, check whether the response
 
 ---
 
-## What code.py Contains
+## What demo_code.py Contains
 
 ### Tools and Dispatch
 
@@ -209,7 +209,7 @@ MCP owns external capability:
 
 ```sh
 cd learn-claude-code
-python s20_comprehensive/code.py
+python s20_comprehensive/demo_code.py
 ```
 
 Try:

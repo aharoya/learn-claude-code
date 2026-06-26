@@ -174,7 +174,7 @@ def agent_loop(messages: list, context: dict):
 
 ```sh
 cd learn-claude-code
-python s10_system_prompt/code.py
+python s10_system_prompt/demo_code.py
 ```
 
 观察重点：
@@ -187,7 +187,7 @@ python s10_system_prompt/code.py
 
 1. `Read the file README.md`（观察始终加载的三个 section）
 2. `Create a file called .memory/MEMORY.md with content "- [test](test.md) — test memory"`（写入记忆索引）
-3. `Read the file code.py`（观察 memory section 是否出现）
+3. `Read the file demo_code.py`（观察 memory section 是否出现）
 
 ---
 

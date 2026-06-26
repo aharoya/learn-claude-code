@@ -121,7 +121,7 @@ for block in response.content:
 
 ## 5. 与本项目 s01 代码的实际关联
 
-在 `s01_agent_loop/code.py` 中，Agent Loop 遍历 `response.content` 来执行工具调用：
+在 `s01_agent_loop/demo_code.py` 中，Agent Loop 遍历 `response.content` 来执行工具调用：
 
 ```python
 for block in response.content:              # ← block 的类型就是 ContentBlock

@@ -112,7 +112,7 @@ The dispatch mechanism is unchanged; the task tool is routed through `TOOL_HANDL
 
 ```sh
 cd learn-claude-code
-python s06_subagent/code.py
+python s06_subagent/demo_code.py
 ```
 
 Try these prompts:

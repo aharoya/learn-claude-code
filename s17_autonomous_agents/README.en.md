@@ -211,7 +211,7 @@ Two teammates claim and work in parallel. Lead only creates tasks and spawns tea
 
 ```sh
 cd learn-claude-code
-python s17_autonomous_agents/code.py
+python s17_autonomous_agents/demo_code.py
 ```
 
 Try this prompt:

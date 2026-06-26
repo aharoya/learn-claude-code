@@ -207,12 +207,12 @@ def agent_loop(messages):
 
 ```sh
 cd learn-claude-code
-python s08_context_compact/code.py
+python s08_context_compact/demo_code.py
 ```
 
 以下のプロンプトを試してみてください：
 
-1. `Read the file README.md, then read code.py, then read s01_agent_loop/README.md`（連続して複数のファイルを読み、L2 の古い結果圧縮を観察）
+1. `Read the file README.md, then read demo_code.py, then read s01_agent_loop/README.md`（連続して複数のファイルを読み、L2 の古い結果圧縮を観察）
 2. `Read every file in s08_context_compact/`（一度に大量の内容を読み込み、L3 のディスク退避を観察）
 3. 20+ ラウンドの対話を繰り返し、`[auto compact]` または `[reactive compact]` が表示されるか観察
 

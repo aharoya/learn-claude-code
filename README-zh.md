@@ -238,7 +238,7 @@ def agent_loop(messages):
 本仓库现在同时保留两条教程线：
 
 - **新版主线：根目录 `s01-s20`**
-  根目录下的 `s01_*` 到 `s20_*` 是新的主版本，也是当前推荐阅读路径。每章包含完整叙事 README、英文/日文译本、可运行的 `code.py`，以及必要的图示。
+  根目录下的 `s01_*` 到 `s20_*` 是新的主版本，也是当前推荐阅读路径。每章包含完整叙事 README、英文/日文译本、可运行的 `demo_code.py`，以及必要的图示。
 - **旧版过渡：`docs/`、`agents/`、当前 `web/`**
   这些仍保留旧 12 章体系，暂时用于已有读者、旧链接和 Web 平台过渡。
 
@@ -285,9 +285,9 @@ cd learn-claude-code
 pip install -r requirements.txt
 cp .env.example .env   # 编辑 .env 填入你的 ANTHROPIC_API_KEY
 
-python s01_agent_loop/code.py        # 起点 — 一个循环 + bash
-python s08_context_compact/code.py    # 上下文压缩（复杂章）
-python s20_comprehensive/code.py      # 终点章: 全部机制归到一个循环
+python s01_agent_loop/demo_code.py        # 起点 — 一个循环 + bash
+python s08_context_compact/demo_code.py    # 上下文压缩（复杂章）
+python s20_comprehensive/demo_code.py      # 终点章: 全部机制归到一个循环
 ```
 
 ### 旧版 12 章过渡线
@@ -387,7 +387,7 @@ learn-claude-code/
     README.md              #   中文源文档（完整叙事）
     README.en.md           #   英文译本
     README.ja.md           #   日文译本
-    code.py                #   独立可运行代码
+    demo_code.py                #   独立可运行代码
     images/                #   SVG 流程图
   s02_tool_use/
   ...

@@ -2,7 +2,7 @@
 """
 s20: Comprehensive Agent — all teaching components in one loop.
 
-Run:  python s20_comprehensive/code.py
+Run:  python s20_comprehensive/demo_code.py
 Need: pip install anthropic python-dotenv pyyaml + .env with ANTHROPIC_API_KEY
 
 This final chapter intentionally puts the earlier teaching mechanisms back

@@ -2,7 +2,7 @@
 """
 s12: Task System — file-persisted task graph with blockedBy dependencies.
 
-Run:  python s12_task_system/code.py
+Run:  python s12_task_system/demo_code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
 Changes from s11:

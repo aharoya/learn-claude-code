@@ -20,7 +20,7 @@ Flow in agent_loop:
 
 Builds on s08 (context compact). Usage:
 
-    python s09_memory/code.py
+    python s09_memory/demo_code.py
     Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
 """
 

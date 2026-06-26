@@ -211,7 +211,7 @@ if len(messages) <= 3:
 
 ```sh
 cd learn-claude-code
-python s17_autonomous_agents/code.py
+python s17_autonomous_agents/demo_code.py
 ```
 
 以下のプロンプトを試してください：

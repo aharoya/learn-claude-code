@@ -24,7 +24,7 @@ Changes from s04:
   + rounds_since_todo counter in agent_loop
   Loop unchanged: new tool auto-dispatches via TOOL_HANDLERS.
 
-Run: python s05_todo_write/code.py
+Run: python s05_todo_write/demo_code.py
 Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
 """
 

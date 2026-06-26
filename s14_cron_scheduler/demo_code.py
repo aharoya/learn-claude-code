@@ -2,7 +2,7 @@
 """
 s14: Cron Scheduler — independent daemon thread + queue processor.
 
-Run:  python s14_cron_scheduler/code.py
+Run:  python s14_cron_scheduler/demo_code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
 Changes from s13:
