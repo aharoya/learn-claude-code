@@ -152,7 +152,9 @@ def run_bash(command: str) -> str:
     超时：120 秒。
     """
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
+        # 创建一个 subprocess.run() 对象，并设置编码为 gbk，捕获输出和错误，并设置超时时间为 120 秒。
+        # windows运行报错，加上encoding="gbk"后执行ok
+        r = subprocess.run(command, shell=True, cwd=WORKDIR, encoding="gbk",
                            capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
