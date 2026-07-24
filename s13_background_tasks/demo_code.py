@@ -1,30 +1,68 @@
 #!/usr/bin/env python3
 """
-s13: Background Tasks — thread-based async execution + notification injection.
+s13: 后台任务 — 线程异步执行 + 通知注入。
 
 Run:  python s13_background_tasks/demo_code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
 Changes from s12:
-  - threading.Thread for background execution
-  - background_tasks dict for lifecycle tracking (bg_id, command, status)
-  - background_results dict + threading.Lock for thread-safe storage
-  - should_run_background: model explicit request via run_in_background param
-  - is_slow_operation: fallback heuristic when model doesn't specify
-  - start_background_task: dispatch to daemon thread, return bg task id
-  - collect_background_results: gather completed, return as notifications
-  - agent_loop: slow ops → background + placeholder, inject notifications
-  - Notifications use <task_notification> format, not reused tool_use_id
-
-Note: Teaching code keeps a basic agent loop to stay focused on background
-tasks. S11's full error recovery (RecoveryState, backoff, escalation,
-reactive compact, fallback model) is omitted.
+  - threading.Thread 后台执行
+  - background_tasks dict 生命周期追踪（bg_id, command, status）
+  - background_results dict + threading.Lock 线程安全存储
+  - should_run_background：模型显式声明 run_in_background 参数 或 启发式判断
+  - is_slow_operation：模型未指定时的 fallback 启发式
+  - start_background_task：分发到守护线程，返回后台任务 ID
+  - collect_background_results：收集已完成的后台结果，返回 <task_notification> XML
+  - agent_loop：慢操作 → 后台 + 占位符，注入通知到 messages
+  - 通知使用 <task_notification> 格式，不复用 tool_use_id
 """
+
+# ======================================================================
+# 执行流程（入口 → 结束）
+# ======================================================================
+#
+#   1. 启动 → 初始化 background_tasks/background_results/background_lock
+#
+#   2. 主循环等待用户输入
+#
+#   3. 用户输入 → agent_loop(history, context)
+#
+#   4. agent_loop 核心循环：
+#
+#      a. 调用 LLM
+#
+#      b. stop_reason != "tool_use"？→ 返回
+#
+#      c. 遍历 tool_use block：
+#
+#         【s13 新增】should_run_background(block)？
+#
+#         是（后台执行路径）：
+#           i.   start_background_task(block)
+#                创建 daemon thread → 线程内 execute_tool(block)
+#                → 完成后回填 background_tasks[bg_id]["status"] = "completed"
+#                回填 background_results[bg_id] = output
+#           ii.  父线程立即返回占位 tool_result：
+#                "[Background task bg_0001 started]..."
+#                Agent 不等待，继续下一轮
+#
+#         否（同步执行路径）：
+#           i.   execute_tool(block) → 直接执行 → 等待结果
+#
+#      d. collect_background_results()
+#         检查是否有之前派发的后台任务已完成
+#         有 → 构造 <task_notification> XML 注入到 user 消息
+#
+#      e. 结果 + 通知一起追加到 messages → 回到步骤 a
+#
+#   5. agent_loop 返回 → 打印 LLM 文本 → 回到步骤 2
+# ======================================================================
 
 import os, subprocess, json, time, random, threading
 from pathlib import Path
 from dataclasses import dataclass, asdict
 
+# ---- readline：终端 UTF-8 支持 ----
 try:
     import readline
     readline.parse_and_bind('set bind-tty-special-chars off')
@@ -34,17 +72,24 @@ except ImportError:
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+# ---- 环境变量 ----
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-WORKDIR = Path.cwd()
-MEMORY_DIR = WORKDIR / ".memory"
-MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+# ---- 全局常量 ----
+WORKDIR = Path.cwd()                        # 工作目录
+MEMORY_DIR = WORKDIR / ".memory"            # 记忆目录
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"     # 记忆索引
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12, synced) ──
+
+# ═══════════════════════════════════════════════════════════
+#  任务系统（s12 引入）
+#
+#  与 s12 完全一致：Task dataclass + CRUD + 依赖管理。
+# ═══════════════════════════════════════════════════════════
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -52,6 +97,7 @@ TASKS_DIR.mkdir(exist_ok=True)
 
 @dataclass
 class Task:
+    """任务数据类：id/subject/description/status/owner/blockedBy。"""
     id: str
     subject: str
     description: str
@@ -96,8 +142,7 @@ def get_task(task_id: str) -> str:
 
 
 def can_start(task_id: str) -> bool:
-    """Check if all blockedBy dependencies are completed.
-    Missing dependencies are treated as blocked."""
+    """检查所有 blockedBy 依赖是否已完成。缺失依赖 = 阻塞。"""
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -138,7 +183,9 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Prompt Assembly (from s10, synced) ──
+# ═══════════════════════════════════════════════════════════
+#  提示词组装系统（s10 引入）
+# ═══════════════════════════════════════════════════════════
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -172,7 +219,9 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools ──
+# ═══════════════════════════════════════════════════════════
+#  工具实现（3 个标准工具 + 5 个任务工具）
+# ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -182,7 +231,7 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # run_in_background is handled by agent_loop dispatch, not here
+    """执行 Shell 命令。run_in_background 由 agent_loop 层处理，此函数不感知。"""
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -212,8 +261,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
-# Task tools
-
+# 任务工具包装（同 s12）
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
     task = create_task(subject, description, blockedBy)
@@ -252,12 +300,22 @@ def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
 
 
+# ═══════════════════════════════════════════════════════════
+#  工具定义（TOOLS）—— 发送给 LLM 的 JSON Schema
+#
+#  s13: bash 新增 run_in_background 参数（可选 bool）。
+#  LLM 可以主动声明"这个命令可能需要很久，后台执行"。
+#  共 8 个工具。
+#
+#  每个工具定义包含三个关键字段：name/description/input_schema。
+# ═══════════════════════════════════════════════════════════
+
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object",
                       "properties": {
                           "command": {"type": "string"},
-                          "run_in_background": {"type": "boolean"}},
+                          "run_in_background": {"type": "boolean"}},  # s13 新增
                       "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
      "input_schema": {"type": "object",
@@ -299,6 +357,10 @@ TOOLS = [
                       "required": ["task_id"]}},
 ]
 
+# ═══════════════════════════════════════════════════════════
+#  工具分发映射（TOOL_HANDLERS）
+# ═══════════════════════════════════════════════════════════
+
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -307,16 +369,42 @@ TOOL_HANDLERS = {
 }
 
 
-# ── Background Tasks (s13 new) ──
+# ═══════════════════════════════════════════════════════════
+#  NEW in s13: 后台任务系统
+#
+#  设计思想：
+#    之前章节中所有工具调用都是同步的——Agent 调用 bash，
+#    阻塞等待 120 秒直到命令完成才继续。这对 pip install
+#    或 npm build 这类长操作是极大的浪费。
+#
+#    s13 引入后台任务：慢操作丢给守护线程，Agent 立即继续。
+#    后台完成后，结果以 <task_notification> XML 注入到
+#    下一轮对话的 user 消息中。
+#
+#  两个触发条件（满足任一即走后台）：
+#    1. LLM 显式设置了 run_in_background=true（主动声明）
+#    2. 启发式检测到慢操作关键词（is_slow_operation）
+#
+#  线程安全：background_lock 保护所有共享字典的读写。
+# ═══════════════════════════════════════════════════════════
 
-_bg_counter = 0
-background_tasks: dict[str, dict] = {}   # bg_id → {tool_use_id, command, status}
-background_results: dict[str, str] = {}   # bg_id → output
-background_lock = threading.Lock()
+_bg_counter = 0                                          # 后台任务 ID 计数器
+background_tasks: dict[str, dict] = {}                   # bg_id → {tool_use_id, command, status}
+background_results: dict[str, str] = {}                  # bg_id → 工具输出文本
+background_lock = threading.Lock()                       # 保护上述两个字典的互斥锁
 
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
-    """Fallback heuristic: commands likely to take > 30s."""
+    """启发式检测：命令是否可能是慢操作（>30 秒）。
+
+    仅对 bash 工具生效。检查命令中是否包含已知慢操作关键词：
+    install, build, test, deploy, compile, docker build,
+    pip install, npm install, cargo build, pytest, make...
+
+    参数 tool_name：工具名。
+    参数 tool_input：工具参数字典。
+    返回：True（可能是慢操作）或 False。
+    """
     if tool_name != "bash":
         return False
     cmd = tool_input.get("command", "").lower()
@@ -327,14 +415,26 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
 
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
+    """判断工具调用是否应走后台执行。
+
+    优先级：
+      1. LLM 显式 run_in_background=true → 直接后台
+      2. 否则 → 启发式检测（is_slow_operation）
+
+    参数 tool_name：工具名。
+    参数 tool_input：工具参数字典。
+    返回：True（后台执行）或 False（同步执行）。
+    """
     if tool_input.get("run_in_background"):
-        return True
+        return True  # 模型明确要求后台
     return is_slow_operation(tool_name, tool_input)
 
 
 def execute_tool(block) -> str:
-    """Execute a tool call block, return output."""
+    """执行工具调用 block，返回输出字符串。
+
+    用于后台线程中的工具执行（与 agent_loop 中的 TOOL_HANDLERS 分发逻辑一致）。
+    """
     handler = TOOL_HANDLERS.get(block.name)
     if handler:
         return handler(**block.input)
@@ -342,24 +442,40 @@ def execute_tool(block) -> str:
 
 
 def start_background_task(block) -> str:
-    """Run tool in a daemon thread. Returns background task ID."""
+    """在守护线程中启动工具执行，立即返回后台任务 ID。
+
+    流程：
+      1. 生成唯一 bg_id（bg_0001, bg_0002, ...）
+      2. 在 background_lock 保护下注册任务（status="running"）
+      3. 创建 daemon thread 执行 worker()
+      4. worker 完成后：background_tasks[bg_id]["status"] = "completed"
+                       background_results[bg_id] = output
+      5. 立即返回 bg_id（不等待线程完成）
+
+    参数 block：tool_use block 对象。
+    返回：后台任务 ID 字符串（如 "bg_0001"）。
+    """
     global _bg_counter
     _bg_counter += 1
     bg_id = f"bg_{_bg_counter:04d}"
     cmd = block.input.get("command", block.name)
 
     def worker():
+        """后台线程工作函数。"""
         result = execute_tool(block)
         with background_lock:
             background_tasks[bg_id]["status"] = "completed"
             background_results[bg_id] = result
 
+    # 注册任务（加锁）
     with background_lock:
         background_tasks[bg_id] = {
             "tool_use_id": block.id,
             "command": cmd,
             "status": "running",
         }
+
+    # 启动守护线程（daemon=True：主线程退出时自动终止）
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     print(f"  \033[33m[background] dispatched {bg_id}: {cmd[:40]}\033[0m")
@@ -367,7 +483,19 @@ def start_background_task(block) -> str:
 
 
 def collect_background_results() -> list[str]:
-    """Collect completed background results as task_notification messages."""
+    """收集所有已完成后台任务的结果，返回 <task_notification> 列表。
+
+    遍历 background_tasks，找出 status=="completed" 的任务。
+    对每个完成任务：
+      1. 从 background_tasks/background_results 中取出（pop）
+      2. 构造 <task_notification> XML 字符串
+      3. 打印完成日志
+
+    注意：pop 操作确保每个任务只被收集一次。
+    调用时机：每轮 LLM 调用后（在 append results 之前）。
+
+    返回：<task_notification> 字符串列表（可能为空）。
+    """
     with background_lock:
         ready_ids = [bid for bid, task in background_tasks.items()
                      if task["status"] == "completed"]
@@ -389,7 +517,9 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
-# ── Context ──
+# ═══════════════════════════════════════════════════════════
+#  上下文评估
+# ═══════════════════════════════════════════════════════════
 
 def update_context(context: dict, messages: list) -> dict:
     """Derive context from real state."""
@@ -405,11 +535,41 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop (simplified, focused on background tasks) ──
+# ═══════════════════════════════════════════════════════════
+#  agent_loop — 后台任务分发 + 通知注入
+#
+#  关键变化（对比 s12）：
+#    工具执行不再是一条直线，而是分叉为两条路径：
+#
+#    同步路径：execute_tool → 立即得到结果 → 追加到 messages
+#    后台路径：start_background_task → 立即返回占位符 →
+#              下一轮 collect_background_results → 注入通知
+#
+#  后台路径的关键设计决策：
+#    为什么用 <task_notification> 而不是 tool_result？
+#    因为 tool_result 需要 tool_use_id 与 LLM 的 tool_use 配对。
+#    后台任务完成后，LLM 已经不在等待那个 tool_call，
+#    强行配对会产生 context 污染。独立的通知格式更清晰。
+# ═══════════════════════════════════════════════════════════
 
 def agent_loop(messages: list, context: dict):
+    """Agent 核心循环：支持后台任务分发的 LLM 交互。
+
+    流程：
+      1. 调用 LLM
+      2. 检查 stop_reason
+      3. 遍历 tool_use：
+         后台？→ start_background_task → 占位 tool_result
+         同步？→ execute_tool → 完整 tool_result
+      4. collect_background_results → <task_notification> 列表
+      5. 结果 + 通知合并追加到 messages → 回到步骤 1
+
+    参数 messages：消息历史列表。
+    参数 context：当前上下文字典。
+    """
     system = get_system_prompt(context)
     while True:
+        # ─── 调用 LLM ───
         try:
             response = client.messages.create(
                 model=MODEL, system=system, messages=messages,
@@ -424,13 +584,17 @@ def agent_loop(messages: list, context: dict):
         if response.stop_reason != "tool_use":
             return
 
+        # ─── 工具分发（两条路径） ───
         results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
             print(f"\033[36m> {block.name}\033[0m")
 
+            # 判断：后台执行 or 同步执行？
             if should_run_background(block.name, block.input):
+                # ── 后台路径 ──
+                # 派发到守护线程，立即返回占位符——Agent 不等待
                 bg_id = start_background_task(block)
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
@@ -438,13 +602,16 @@ def agent_loop(messages: list, context: dict):
                                            f"Command: {block.input.get('command', '')}. "
                                            f"Result will be available when complete."})
             else:
+                # ── 同步路径 ──
                 output = execute_tool(block)
                 print(str(output)[:300])
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": output})
 
-        # Inject tool results + background notifications in one user message
+        # ─── 通知注入 ───
+        # 检查之前派发的后台任务是否完成了，完成的通知以 <task_notification>
+        # XML 混入 user 消息。LLM 下一轮会看到这些通知并可以据此采取行动。
         user_content = list(results)
         bg_notifications = collect_background_results()
         if bg_notifications:
@@ -457,6 +624,9 @@ def agent_loop(messages: list, context: dict):
         system = get_system_prompt(context)
 
 
+# ═══════════════════════════════════════════════════════════
+#  主入口
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("s13: background tasks")
     print("Enter a question, press Enter to send. Type q to quit.\n")
