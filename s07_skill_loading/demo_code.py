@@ -135,6 +135,9 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     """
     if not text.startswith("---"):
         return {}, text
+    # split的maxsplit参数，表示最多分割的次数，默认为-1，表示不限制分割次数
+    # 找到前 2 个 "---" 并将其作为切割点。
+    # 切割后，返回一个最多包含 3 个元素的列表。
     parts = text.split("---", 2)
     if len(parts) < 3:
         return {}, text
