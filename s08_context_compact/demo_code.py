@@ -823,6 +823,7 @@ def agent_loop(messages: list):
         else:
             # ─── 正常路径：没有 compact 被调用 ───
             # for/else 语法：for 循环没有被 break 中断时执行 else
+            # 这个for/else语法很有必要
             messages.append({"role": "user", "content": results})
             continue
         # ─── 紧凑路径：compact 被调用了（for 循环被 break）───
