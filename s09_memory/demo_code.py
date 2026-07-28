@@ -801,7 +801,9 @@ def agent_loop(messages: list):
     # ─── 步骤 1-2：记忆选择 + SYSTEM 构建 ───
     # 每次进入 agent_loop 调用一次（每个 user 轮次）
     memories_content = load_memories(messages)
-    # 记录当前 user 消息的索引（用于步骤 5 的注入位置定位）
+    # 记录当前 user 消息的索引（用于步骤 5 的记忆注入定位）
+    # 判断逻辑：最新一条必须是纯文本 user 消息（content 是 str），
+    # 不能是 tool_result 列表——记忆只能注入到文本消息前面。
     memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
     system = build_system()  # 含最新记忆索引的 SYSTEM
 
@@ -824,10 +826,20 @@ def agent_loop(messages: list):
 
         # ─── 步骤 5-6：记忆注入 + LLM 调用 ───
         try:
-            # 将相关记忆内容拼接到当前 user 消息前面
-            request_messages = messages
+            # 将相关记忆内容拼接到当前 user 消息前面。
+            # 注意：记忆内容不能直接改到 messages 里，否则下轮
+            # while 迭代再拼接时会把上一轮的也带上，越叠越长。
+            #
+            # 所以策略是：只有当有记忆内容要注入时，才做浅拷贝
+            # （request_messages = messages.copy()），在拷贝上修改，
+            # 传给 LLM。原始 messages 保持干净。
+            request_messages = messages  # 默认：无记忆注入，直接复用
             if memories_content and memory_turn is not None and memory_turn < len(messages):
-                request_messages = messages.copy()  # 不修改原始 messages
+                request_messages = messages.copy()
+                # 构造新字典：用 ** 展开原消息的所有字段（role 等），
+                # 再单独写 content 覆盖掉解包进来的旧 content。
+                # 等效于：先复制再 request_messages[turn]["content"] = ...
+                # 但解包写法在一行表达"只改 content"更紧凑，且不修改原字典。
                 request_messages[memory_turn] = {
                     **messages[memory_turn],
                     "content": memories_content + "\n\n" + messages[memory_turn]["content"],
