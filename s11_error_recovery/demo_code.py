@@ -424,10 +424,9 @@ def agent_loop(messages: list, context: dict):
         # ─── 步骤 1：LLM 调用（with_retry 内部处理 429/529） ───
         try:
             response = with_retry(
-                lambda mt=max_tokens, mdl=state.current_model:
-                    client.messages.create(
-                        model=mdl, system=system, messages=messages,
-                        tools=TOOLS, max_tokens=mt),
+                lambda: client.messages.create(
+                    model=state.current_model, system=system, messages=messages,
+                    tools=TOOLS, max_tokens=max_tokens),
                 state)
         except Exception as e:
             # with_retry 没处理 = 非瞬时错误 → 进入路径判断
