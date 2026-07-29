@@ -75,6 +75,11 @@ from dotenv import load_dotenv
 
 # ---- 环境变量 ----
 load_dotenv(override=True)
+# override=True：允许 .env 中的值覆盖已存在的环境变量。
+# 如果设置了 ANTHROPIC_BASE_URL（使用第三方兼容接口），需要移除
+# ANTHROPIC_AUTH_TOKEN，避免与 ANTHROPIC_API_KEY 冲突。
+# Anthropic SDK 优先用 ANTHROPIC_API_KEY（header），如果同时存在
+# ANTHROPIC_AUTH_TOKEN（header），两个 header 都发会被服务端拒掉。
 if os.getenv("ANTHROPIC_BASE_URL"): os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 # ---- 全局常量 ----
@@ -85,7 +90,12 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"                       # 记忆索引文�
 SKILLS_DIR = WORKDIR / "skills"                               # 技能目录（s07 引入）
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"                     # 转录存档目录（s08 引入）
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results" # 工具输出持久化（s08 引入）
+# Anthropic 客户端。base_url 从 .env 取，不设则用 SDK 默认值
+# （api.anthropic.com）。设了 ANTHROPIC_BASE_URL 就可以指向
+# 任意兼容 Anthropic 接口的第三方提供商（DeepSeek/GLM 等）。
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))  # Anthropic 客户端
+# MODEL_ID 必须在 .env 中设置，如 "claude-sonnet-4-20250514"
+# 或第三方模型的兼容 ID（如 "deepseek-chat"）。
 MODEL = os.environ["MODEL_ID"]                                # 模型 ID
 
 
@@ -117,10 +127,26 @@ MEMORY_TYPES = ["user", "feedback", "project", "reference"]
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
     """解析 YAML frontmatter（手动冒号解析，不依赖 pyyaml）。
 
+    frontmatter 是 Markdown 文件开头 `---` 之间的一段 YAML 元数据：
+        ---
+        name: use-tab
+        type: user
+        ---
+        正文内容...
+
+    text.split("---", 2) 的 maxsplit=2 是关键：
+      第 0 段：开头的空字符串（因为 text 以 "---" 开头）
+      第 1 段：frontmatter 内容
+      第 2 段：正文（可能含 "---"，比如代码块里）
+    用 maxsplit=2 确保只按前两个 "---" 分割，正文里的不误伤。
+
     返回：(meta_dict, body_text)。
     """
     if not text.startswith("---"):
         return {}, text
+    # maxsplit=2：最多切 2 刀，得到 3 段。
+    # 如果正文里也有 "---"（比如代码块 `---`），
+    # 不设 maxsplit 会继续切，只留最后一段，丢失大部分正文。
     parts = text.split("---", 2)
     if len(parts) < 3:
         return {}, text
@@ -243,10 +269,14 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
         return []
 
     # 收集最近 3 条 user 消息作为上下文（最多 2000 字符）
+    # 为什么要倒序遍历？因为 messages[-1] 是最新消息，越近的越相关。
+    # 用 reversed 从后往前找，找到够 3 条 user 消息就停。
     recent_texts = []
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
+            # content 可能是 str（纯文本消息）也可能是 list（含 tool_result 的消息）。
+            # 从 list 中只提取 type=="text" 的文本块，忽略 tool_result/thinking 等。
             if isinstance(content, list):
                 content = " ".join(
                     str(getattr(b, "text", "")) for b in content
@@ -256,12 +286,17 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
                 recent_texts.append(content)
             if len(recent_texts) >= 3:
                 break
+    # 因为是从后往前收集的，recent_texts 的顺序是 [最新, 次新, 第三新]。
+    # reversed() 把顺序翻回正常时间序 [最老...最新]，方便 LLM 理解上下文。
     recent = " ".join(reversed(recent_texts))[:2000]
 
     if not recent.strip():
         return []
 
     # 构建记忆目录供 LLM 选择
+    # 每条一行："0: use-tab — User prefers tabs" ，
+    # 不传正文内容给 LLM，只传 name+description 做轻量判断。
+    # 这样可以降低 side-query 的 token 消耗。
     catalog_lines = []
     for i, f in enumerate(files):
         catalog_lines.append(f"{i}: {f['name']} — {f['description']}")
@@ -283,7 +318,8 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
             max_tokens=200,
         )
         text = extract_text(response.content).strip()
-        # LLM 可能返回 JSON 外还带解释文本，用正则提取 [] 部分
+        # LLM 可能返回 JSON 外还带解释文本（如 "Based on the conversation, [0, 3] are relevant."），
+        # 所以用正则提取第一个 [...] 部分，而不是直接 json.loads 整个文本。
         match = re.search(r'\[.*?\]', text, re.DOTALL)
         if match:
             indices = json.loads(match.group())
@@ -295,9 +331,11 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
                         break
             return selected
     except Exception:
-        pass  # LLM 选择失败 → Fallback 到关键词匹配
+        pass  # LLM 选择失败（API 错误/JSON 解析失败）→ Fallback 到关键词匹配
 
     # Fallback：关键词匹配（简单但可靠）
+    # 取 recent 中长度 > 3 的词，在 name+description 中搜索。
+    # 长度 > 3 的过滤去掉 "the"、"and"、"for" 等无意义短词。
     keywords = [w.lower() for w in recent.split() if len(w) > 3]
     selected = []
     for f in files:
@@ -317,6 +355,10 @@ def load_memories(messages: list) -> str:
 
     参数 messages：消息历史（用于判断相关性）。
     返回：格式化的记忆内容字符串；无相关记忆时返回 ""。
+
+    注意：这个函数只返回字符串，真正的"注入"发生在 agent_loop 中——
+    将返回的字符串拼接到当前 user 消息的 content 前面。
+    这里不直接修改 messages，保持职责单一。
     """
     selected_files = select_relevant_memories(messages)
     if not selected_files:
@@ -339,18 +381,31 @@ def extract_memories(messages: list):
     写入前检查已有记忆避免重复。
 
     参数 messages：原始消息列表（压缩前的快照）。
+
+    为什么用 messages[-10:]？只取最相关的尾部对话，避免把整个
+    对话历史传给 LLM，节省 token。10 条足够 LLM 判断"用户刚刚
+    表达了什么偏好"。
+
+    为什么传 pre_compress 而不是压缩后的 messages？
+    压缩后 tool_result 被替换成占位符、中间消息被 snipped，
+    LLM 看不到完整信息，无法准确判断"这个值不值得记"。
     """
     # 收集最近 10 条消息的文本
     dialogue_parts = []
     for msg in messages[-10:]:
         role = msg.get("role", "?")
         content = msg.get("content", "")
+        # content 可能是 list（含 tool_result/thinking 等块），
+        # 提取其中的 text 块，忽略 tool_result 等非文本内容。
+        # tool_result 是工具执行输出，通常不会包含用户偏好信息。
         if isinstance(content, list):
             content = " ".join(
                 str(getattr(b, "text", "")) for b in content
                 if getattr(b, "type", None) == "text"
             )
         if isinstance(content, str) and content.strip():
+            # 格式成 "user: xxx" / "assistant: xxx"，
+            # LLM 能通过角色区分"是用户说的还是 AI 说的"。
             dialogue_parts.append(f"{role}: {content}")
     dialogue = "\n".join(dialogue_parts)
 
@@ -358,6 +413,7 @@ def extract_memories(messages: list):
         return
 
     # 列出现有记忆，帮助 LLM 判断"这个是不是新信息"
+    # 如果不给现有记忆列表，LLM 可能重复提取已经存过的记忆。
     existing = list_memory_files()
     existing_desc = "\n".join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
 
@@ -380,6 +436,7 @@ def extract_memories(messages: list):
         )
         text = extract_text(response.content).strip()
         # Extract JSON array from response
+        # 用 re.DOTALL 让 . 可以匹配换行符，跨行 JSON 也能提取
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if not match:
             return
@@ -392,6 +449,8 @@ def extract_memories(messages: list):
             mem_type = mem.get("type", "user")
             desc = mem.get("description", "")
             body = mem.get("body", "")
+            # 只有 description 和 body 都非空才写入，
+            # 避免 LLM 返回了残缺的记忆条目。
             if desc and body:
                 write_memory_file(name, mem_type, desc, body)
                 count += 1
@@ -419,12 +478,22 @@ def consolidate_memories():
       3. 将总数控制在 30 条以内
       4. 优先保留用户偏好
 
-    实现方式：删除所有旧文件 → 写回 LLM 整理后的记忆。
+    实现方式：先清空所有旧记忆文件，再写回 LLM 整理后的列表。
+    这种"先删后写"的策略比逐文件比较更简单，但要注意：
+    如果 LLM 调用失败，所有旧记忆也会被清空。（当前实现中
+    清空发生在 LLM 调用成功后，所以安全。）
+
+    类比：把这个过程想象成"做梦"——睡眠时大脑整理白天的记忆，
+    合并重复的、丢弃不重要的、巩固重要的。
     """
     files = list_memory_files()
     if len(files) < CONSOLIDATE_THRESHOLD:
+        # 记忆太少不值得整理。阈值 10 是个经验值：
+        # 太少的话 LLM 没什么可合并的，白白消耗 token。
+        # 频繁整理也会让记忆文件频繁变动，影响索引稳定性。
         return
 
+    # 把所有记忆拼成一份 Markdown 传给 LLM
     catalog = "\n\n".join(
         f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
         for f in files
@@ -451,8 +520,10 @@ def consolidate_memories():
         items = json.loads(match.group())
 
         # 清空所有旧记忆文件（保留 MEMORY.md，它会被 _rebuild_index 重建）
+        # 注意：清空发生在 LLM 成功返回之后，不是之前。
         for f in MEMORY_DIR.glob("*.md"):
             if f.name != "MEMORY.md":
+                # 删除旧记忆文件
                 f.unlink()
 
         # 写入 LLM 整理后的记忆
@@ -482,6 +553,11 @@ def build_system() -> str:
     调用 read_memory_index() 获取 MEMORY.md 内容，
     注入到 SYSTEM 中作为 "Memories available" 段落。
     同时提示 LLM 尊重记忆中的偏好，并在用户说 "remember" 时提取。
+
+    SYSTEM 提示词和 user 消息的区别：
+    - SYSTEM：每次 LLM 调用都可见，适合放"始终需要知道"的信息（记忆索引）
+    - user 消息：按需注入完整记忆内容（详见 agent_loop 中的注入逻辑）
+    这样索引常驻（可被 prompt cache 缓存），内容按需加载（不浪费 token）。
     """
     index = read_memory_index()
     memories_section = f"\n\nMemories available:\n{index}" if index else ""
@@ -576,6 +652,17 @@ def spawn_subagent(description: str) -> str:
     """创建子 Agent，用全新上下文执行子任务。
 
     子 Agent 不具备记忆功能——记忆属于父 Agent。
+    子 Agent 用独立的 SUB_SYSTEM（不包含记忆索引）和独立的
+    SUB_TOOLS（只有 bash/read_file/write_file 三个工具，
+    没有 edit/glob/task，防止子 Agent 再创建子 Agent）。
+
+    30 轮上限（for _ in range(30)）：防止子 Agent 陷入无限循环。
+    LLM 每轮要么调工具要么结束，30 轮对于大多数子任务足够了。
+
+    返回值提取策略：
+    1. 先看最后一条 user 消息的文本（子 Agent 结束时留下的摘要）
+    2. 如果为空，从后往前找第一条 assistant 消息的文本
+    3. 都找不到则返回兜底信息
     """
     print(f"\n\033[35m[Subagent spawned]\033[0m")
     messages = [{"role": "user", "content": description}]
@@ -592,8 +679,11 @@ def spawn_subagent(description: str) -> str:
                 print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
+    # 子 Agent 结束后，提取最终结果文本
     result = extract_text(messages[-1]["content"])
     if not result:
+        # 如果最后一条不是文本（比如退出的最后一步是 tool_result），
+        # 从后往前找第一条 assistant 消息的文本内容。
         for msg in reversed(messages):
             if msg["role"] == "assistant":
                 result = extract_text(msg["content"])
@@ -619,11 +709,22 @@ def estimate_size(msgs):
     return len(str(msgs))
 
 def _block_type(block):
-    """获取 block 的 type 属性（兼容 dict 和 object 两种格式）。"""
+    """获取 block 的 type 属性（兼容 dict 和 object 两种格式）。
+
+    Anthropic SDK 返回的 response.content 是对象列表（有 .type 属性），
+    但 agent_loop 中构造的 tool_result 是 dict（有 ["type"] 键）。
+    这个函数兼容两者，避免类型判断散落在各处。
+    """
     return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
 
 def _message_has_tool_use(msg):
-    """判断 assistant 消息是否包含 tool_use block。用于边界保护。"""
+    """判断 assistant 消息是否包含 tool_use block。用于边界保护。
+
+    在裁剪消息时，如果一条 assistant 消息包含 tool_use，
+    它后面通常跟着一条 user 消息包含对应的 tool_result。
+    裁剪时要把这对"请求-响应"当作一个整体处理，
+    不能拆开（否则 LLM 看到 tool_result 没有对应的 tool_use 会困惑）。
+    """
     if msg.get("role") != "assistant":
         return False
     content = msg.get("content")
@@ -632,7 +733,11 @@ def _message_has_tool_use(msg):
     return any(_block_type(block) == "tool_use" for block in content)
 
 def _is_tool_result_message(msg):
-    """判断 user 消息是否包含 tool_result block。用于边界保护。"""
+    """判断 user 消息是否包含 tool_result block。用于边界保护。
+
+    和 _message_has_tool_use 配对使用，确保 tool_use/tool_result
+    这对消息在裁剪时不会被拆散。
+    """
     if msg.get("role") != "user":
         return False
     content = msg.get("content")
@@ -641,12 +746,26 @@ def _is_tool_result_message(msg):
     return any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
 
 def snip_compact(msgs, mx=50):
-    """L1：裁剪中间消息，保留头尾 + 配对保护。"""
+    """L1：裁剪中间消息，保留头尾 + 配对保护。
+
+    策略：保留前 3 条（通常是初始请求+早期工具调用）和
+    后 (mx-3) 条最新消息，中间的替换为一条 snipped 占位符。
+
+    配对保护（head_end/tail_start 调整）：
+    如果裁剪边界正好切在 tool_use 和 tool_result 之间，
+    会调整边界把整对消息保留下来。否则 LLM 看到孤立的
+    tool_result 会不知道对应哪个调用。
+    """
     if len(msgs) <= mx: return msgs
     head_end, tail_start = 3, len(msgs) - (mx - 3)
+    # 头部保护：如果 head_end 前一条是含 tool_use 的 assistant 消息，
+    # 把后面的 tool_result 也保留，避免 tool_use/tool_result 被拆散。
     if head_end > 0 and _message_has_tool_use(msgs[head_end - 1]):
         while head_end < len(msgs) and _is_tool_result_message(msgs[head_end]):
             head_end += 1
+    # 尾部保护：如果 tail_start 正好是一条 tool_result 消息，
+    # 且它前面是含 tool_use 的 assistant 消息，把 tail_start 前移一位，
+    # 保留这对 tool_use/tool_result。
     if (tail_start > 0 and tail_start < len(msgs)
             and _is_tool_result_message(msgs[tail_start])
             and _message_has_tool_use(msgs[tail_start - 1])):
@@ -665,7 +784,13 @@ def collect_tool_results(msgs):
     return blocks
 
 def micro_compact(msgs):
-    """L2：旧 tool_result 替换为占位符（保留最近 KEEP_RECENT 个）。"""
+    """L2：旧 tool_result 替换为占位符（保留最近 KEEP_RECENT 个）。
+
+    策略：tool_result 的内容通常很长（文件内容、命令输出），
+    但只有最近的几个对"当前正在做什么"有影响。
+    早期的 tool_result 用短占位符替换，节省 token。
+    注意：只替换长度 > 120 的，短的结果没必要替换。
+    """
     tr = collect_tool_results(msgs)
     if len(tr) <= KEEP_RECENT: return msgs
     for _, _, b in tr[:-KEEP_RECENT]:
@@ -673,7 +798,14 @@ def micro_compact(msgs):
     return msgs
 
 def persist_large(tid, out):
-    """L3：超大输出写入磁盘，返回 <persisted-output> 引用。"""
+    """L3：超大输出写入磁盘，返回 <persisted-output> 引用。
+
+    把大输出写到 .task_outputs/tool-results/<tid>.txt，
+    在消息中只保留一个引用链接 + 前 2000 字符预览。
+    LLM 如果确实需要完整内容，可以用 read_file 工具读这个文件。
+
+    tid：tool_use_id，确保文件名唯一。
+    """
     if len(out) <= PERSIST_THRESHOLD: return out
     TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     p = TOOL_RESULTS_DIR / f"{tid}.txt"
@@ -681,12 +813,18 @@ def persist_large(tid, out):
     return f"<persisted-output>\nFull: {p}\nPreview:\n{out[:2000]}\n</persisted-output>"
 
 def tool_result_budget(msgs, mx=200_000):
-    """L3：检查最新一轮 tool_result 总量，超大则持久化。"""
+    """L3：检查最新一轮 tool_result 总量，超大则持久化。
+
+    不是替换整个消息，而是对超大（>PERSIST_THRESHOLD）的
+    单个 tool_result 做持久化。从最大的开始处理，直到
+    总大小降到 mx 以下。
+    """
     last = msgs[-1] if msgs else None
     if not last or last.get("role") != "user" or not isinstance(last.get("content"), list): return msgs
     blocks = [(i, b) for i, b in enumerate(last["content"]) if isinstance(b, dict) and b.get("type") == "tool_result"]
     total = sum(len(str(b.get("content", ""))) for _, b in blocks)
     if total <= mx: return msgs
+    # 按内容长度降序排列，从最大的开始持久化
     for _, block in sorted(blocks, key=lambda p: len(str(p[1].get("content", ""))), reverse=True):
         if total <= mx: break
         c = str(block.get("content", ""))
@@ -696,7 +834,11 @@ def tool_result_budget(msgs, mx=200_000):
     return msgs
 
 def write_transcript(msgs):
-    """将完整 messages 保存为 JSONL 文件。L4 和 reactive 的安全网。"""
+    """将完整 messages 保存为 JSONL 文件。L4 和 reactive 的安全网。
+
+    在压缩前保存一份完整转录，防止压缩不可逆丢失信息。
+    JSONL 格式（每行一个 JSON 对象），方便后续按行读取。
+    """
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     p = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with p.open("w") as f:
@@ -713,15 +855,27 @@ def summarize_history(msgs):
     return extract_text(r.content).strip()
 
 def compact_history(msgs):
-    """L4：保存转录 → LLM 摘要 → 返回紧凑 messages。"""
+    """L4：保存转录 → LLM 摘要 → 返回紧凑 messages。
+
+    用 LLM 生成的摘要替换整个对话历史。
+    返回只有一条消息的列表，内容是 "[Compacted]\n\n<摘要>"。
+    这是最激进的压缩，只在其他层都不够时触发。
+    """
     write_transcript(msgs)
     summary = summarize_history(msgs)
     return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
 
 def reactive_compact(msgs):
-    """应急压缩：API 报 prompt_too_long 时，保留尾部 5 条 + 摘要前半部分。"""
+    """应急压缩：API 报 prompt_too_long 时，保留尾部 5 条 + 摘要前半部分。
+
+    和 compact_history 的区别：
+    - compact_history 压缩整个对话（API 调用前主动压缩）
+    - reactive_compact 只在 API 抛出 prompt_too_long 后被动触发
+    - reactive_compact 保留尾部 5 条原始消息，不是全部摘要
+    """
     write_transcript(msgs)
     tail_start = max(0, len(msgs) - 5)
+    # 尾部保护：同样要确保 tool_use/tool_result 不被拆散
     if (tail_start > 0 and tail_start < len(msgs)
             and _is_tool_result_message(msgs[tail_start])
             and _message_has_tool_use(msgs[tail_start - 1])):
@@ -795,6 +949,18 @@ def agent_loop(messages: list):
       8. 工具分发 → 结果回写 → 回到步骤 4
 
     参数 messages：消息历史列表（对话上下文）。
+
+    ────── 关于 while True 的迭代边界 ──────
+    每一次 while 迭代 = 一轮 LLM 调用。
+    每轮可能是 LLM 调用工具（tool_use）、或者 LLM 结束（end_turn）。
+    工具调用后，把结果追加到 messages，继续下一轮 while。
+    所以一轮用户输入可能对应多次 while 迭代（每次 LLM 调一个工具）。
+
+    ────── 关于记忆的持久性 ──────
+    记忆提取（extract_memories）发生在整个 agent_loop 结束时
+    （所有工具调用完成，LLM 给出最终回答后）。
+    这意味着：如果用户在对话中间说了"记住这个偏好"，
+    要等到这一轮对话全部结束才会写入记忆文件。
     """
     reactive_retries = 0
 
@@ -816,13 +982,13 @@ def agent_loop(messages: list):
             "content": str(m.get("content",""))} for m in messages]
 
         # ─── 步骤 4：压缩管道（同 s08） ───
-        messages[:] = tool_result_budget(messages)    # L3
-        messages[:] = snip_compact(messages)          # L1
-        messages[:] = micro_compact(messages)         # L2
+        messages[:] = tool_result_budget(messages)    # L3：超大 tool_result 持久化
+        messages[:] = snip_compact(messages)          # L1：裁剪中间消息
+        messages[:] = micro_compact(messages)         # L2：旧 tool_result 占位符
 
         if estimate_size(messages) > CONTEXT_LIMIT:
             print("[auto compact]")
-            messages[:] = compact_history(messages)   # L4
+            messages[:] = compact_history(messages)   # L4：LLM 摘要
 
         # ─── 步骤 5-6：记忆注入 + LLM 调用 ───
         try:
@@ -853,19 +1019,24 @@ def agent_loop(messages: list):
                 print("[reactive compact]")
                 messages[:] = reactive_compact(messages)
                 reactive_retries += 1
-                continue
-            raise
+                continue  # 用压缩后的 messages 重试 LLM 调用
+            raise  # 非 prompt_too_long 错误，直接抛出
 
         # ─── 步骤 7：LLM 完成 → 提取记忆 → 返回 ───
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
-            # 使用 pre_compress 快照（完整对话）提取记忆
+            # LLM 不再调用工具了，本轮对话结束。
+            # 使用 pre_compress 快照（完整对话，未压缩）提取记忆。
+            # 为什么用 pre_compress 而不是当前的 messages？
+            # 当前的 messages 已经被压缩过了（snipped/micro/compact），
+            # 细节丢失了。pre_compress 保存了调用 LLM 之前的完整对话。
             extract_memories(pre_compress)
-            # 定期清理合并
+            # 定期检查是否需要合并去重（文件数 >= 10 时触发）
             consolidate_memories()
             return
 
         # ─── 步骤 8：工具分发执行 ───
+        # LLM 调用了工具 → 遍历每个 tool_use block，执行对应的函数。
         results = []
         for block in response.content:
             if block.type != "tool_use": continue
@@ -874,7 +1045,9 @@ def agent_loop(messages: list):
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
             print(str(output)[:200])
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        # 把工具执行结果追加到 messages，下一轮 while 迭代 LLM 会看到。
         messages.append({"role": "user", "content": results})
+        # 回到 while 顶部 → 步骤 3：再次压缩、记忆注入、调 LLM……
 
 
 # ═══════════════════════════════════════════════════════════
@@ -890,6 +1063,10 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""): break
         history.append({"role": "user", "content": query})
         agent_loop(history)
+        # agent_loop 返回后，history[-1] 是最后一条 assistant 消息。
+        # assistant 消息的 content 可能包含多种 block（text, tool_use 等），
+        # 但 agent_loop 结束时只会剩 text block（因为 stop_reason != "tool_use"）。
+        # 只打印 text 块，忽略其他类型。
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text": print(block.text)
         print()
