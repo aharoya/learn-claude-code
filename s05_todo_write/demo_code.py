@@ -419,8 +419,6 @@ register_hook("Stop", summary_hook)
 #    todo 列表过时。nag 是轻量级的自愈机制。
 # ═══════════════════════════════════════════════════════════
 
-rounds_since_todo = 0  # 模块级计数器，跨 agent_loop 调用保持
-
 def agent_loop(messages: list):
     """Agent 核心循环：在 s04 基础上新增计划提醒。
 
@@ -437,7 +435,7 @@ def agent_loop(messages: list):
 
     参数 messages：消息历史列表（对话上下文）。
     """
-    global rounds_since_todo
+    rounds_since_todo = 0
     while True:
         # --- 步骤 1：nag 提醒 ---
         # 如果连续 3 轮 LLM 响应没有调用 todo_write，注入提醒

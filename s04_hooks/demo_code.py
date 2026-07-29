@@ -353,7 +353,7 @@ def permission_hook(block):
                 if choice not in ("y", "yes"):
                     return "Permission denied by user"
     # 文件操作：工作目录边界检查
-    if block.name in ("write_file", "edit_file"):
+    if block.name in ("read_file", "write_file", "edit_file"):
         path = block.input.get("path", "")
         if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
             print(f"\n\033[33m⚠  Writing outside workspace\033[0m")

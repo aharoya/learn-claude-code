@@ -319,7 +319,7 @@ def check_deny_list(command: str) -> str | None:
 # 不需要改动 check_permission() 或 agent_loop。
 PERMISSION_RULES = [
     # 规则 1：写入/编辑操作时，检查目标路径是否在工作目录内
-    {"tools": ["write_file", "edit_file"],
+    {"tools": ["read_file", "write_file", "edit_file"],
      "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
      "message": "Writing outside workspace"},
     # 规则 2：bash 操作时，检查命令是否包含破坏性关键词

@@ -525,8 +525,6 @@ register_hook("Stop", summary_hook)
 #  循环代码不需要知道 task 是什么。
 # ═══════════════════════════════════════════════════════════
 
-rounds_since_todo = 0  # nag 计数器，跨 agent_loop 调用保持
-
 def agent_loop(messages: list):
     """Agent 核心循环：在 s05 基础上透明支持子 Agent 委托。
 
@@ -543,7 +541,7 @@ def agent_loop(messages: list):
 
     参数 messages：消息历史列表（对话上下文）。
     """
-    global rounds_since_todo
+    rounds_since_todo = 0
     while True:
         # --- 步骤 1：nag 提醒（s05 引入） ---
         if rounds_since_todo >= 3 and messages:
