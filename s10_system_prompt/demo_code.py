@@ -96,11 +96,12 @@ MODEL = os.environ["MODEL_ID"]              # 模型 ID
 # 每个片段是一个 key → 文本的映射。
 # assemble_system_prompt 根据 context 决定包含哪些片段。
 # 新增片段只需加一个 key，不需要改其他代码。
+# 注意：tools 和 workspace 不再是硬编码的 PROMPT_SECTIONS 条目，
+# 而是从 context 动态组装——update_context 每轮工具执行后重新评估，
+# 将 enabled_tools 和 workspace 写入 context，这里从 context 读取。
+# 这样新增工具或工作目录变化时无需修改 PROMPT_SECTIONS 常量。
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file.",
-    "workspace": f"Working directory: {WORKDIR}",
-    "memory": "Relevant memories are injected below when available.",
 }
 
 
@@ -109,7 +110,9 @@ def assemble_system_prompt(context: dict) -> str:
 
     这是 SYSTEM 的"组装车间"——决定哪些片段生效。
     组装逻辑有三类：
-      - 始终加载：identity、tools、workspace
+      - 始终加载：identity（身份描述）
+      - 动态组装：tools 从 context["enabled_tools"] 拼接列表，
+                  workspace 从 context["workspace"] 读取
       - 条件加载：memory（仅在 context["memories"] 非空时）
 
     参数 context：update_context 返回的上下文字典。
@@ -119,8 +122,15 @@ def assemble_system_prompt(context: dict) -> str:
 
     # 始终加载的基础片段
     sections.append(PROMPT_SECTIONS["identity"])
-    sections.append(PROMPT_SECTIONS["tools"])
-    sections.append(PROMPT_SECTIONS["workspace"])
+
+    # 动态组装：从 context 读取真实状态
+    # 注意：这里没有直接读 PROMPT_SECTIONS，而是从 context 获取，
+    # 因为 context 由 update_context 每轮从真实状态推导，
+    # 确保 tools 列表和 workspace 路径始终是最新的。
+    tools = ", ".join(context.get("enabled_tools", []))
+    if tools:
+        sections.append(f"Available tools: {tools}.")
+    sections.append(f"Working directory: {context.get("workspace", WORKDIR)}")
 
     # 条件加载：MEMORY.md 有内容时才注入记忆
     memories = context.get("memories", "")
