@@ -136,7 +136,7 @@ def compact_history(messages):
 
 Sometimes the API still returns `prompt_too_long` (413) — when context grows faster than compression triggers.
 
-This triggers **reactive_compact**: more aggressive than compact_history, it retreats from the tail, but still avoids leaving an orphaned `tool_result`.
+This triggers **reactive_compact**: more aggressive than compact_history in trigger (emergency response to a 413 error), but more conservative in what it removes, keeping ~5 recent messages and only summarizing earlier history. Still avoids an orphaned `tool_result`.
 
 ```python
 def reactive_compact(messages):

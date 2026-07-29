@@ -195,15 +195,15 @@ Two teammates claim and work in parallel. Lead only creates tasks and spawns tea
 | Component | Before (s16) | After (s17) |
 |-----------|-------------|-------------|
 | Task assignment | Lead manually assigns | Teammates auto-claim (can_start checks deps) |
-| Teammate state | WORK or exit | WORK → IDLE (60s poll) → SHUTDOWN |
+| Teammate state | WORK → IDLE (1s inbox poll) → WORK / SHUTDOWN | WORK → IDLE (5s inbox + task board poll, 60s timeout) → WORK / SHUTDOWN |
 | claim_task | No owner check | Rejects tasks that already have an owner |
-| IDLE phase shutdown | Doesn't handle shutdown_request | Dispatches shutdown immediately and exits |
-| Lead inbox | Prints only, not in context | consume_lead_inbox injects into history |
-| New functions | — | idle_poll, scan_unclaimed_tasks, consume_lead_inbox |
+| IDLE phase shutdown | Exits after receiving shutdown_request | Dispatches shutdown immediately and exits |
+| Lead inbox | consume_lead_inbox routes protocol responses and injects into context | Reuses consume_lead_inbox mechanism |
+| New functions | consume_lead_inbox already exists | idle_poll, scan_unclaimed_tasks (reuses consume_lead_inbox) |
 | Identity persistence | System prompt only | Auto re-inject after compression |
-| Lead tools | 14 (s16) | 14 (unchanged) |
+| Lead tools | 14 | 14 (unchanged) |
 | Teammate tools | 5 | 8 (+ list_tasks, claim_task, complete_task) |
-| Teammate exit | Exit after task done | Exit only after 60s idle timeout |
+| Teammate exit | WORK ends → enters IDLE, waits for shutdown_request (no timeout) | Exits after 60s idle timeout or receiving shutdown_request |
 
 ---
 

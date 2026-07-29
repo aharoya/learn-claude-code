@@ -68,9 +68,6 @@ s10 は prompt アセンブリ機構に焦点を当てる。s08-s09 の能力を
 ```python
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file.",
-    "workspace": f"Working directory: {WORKDIR}",
-    "memory": "Relevant memories are injected below when available.",
 }
 ```
 
@@ -86,8 +83,12 @@ def assemble_system_prompt(context: dict) -> str:
 
     # 常にロード
     sections.append(PROMPT_SECTIONS["identity"])
-    sections.append(PROMPT_SECTIONS["tools"])
-    sections.append(PROMPT_SECTIONS["workspace"])
+
+    # context から動的に tools と workspace を取得
+    tools = ", ".join(context.get("enabled_tools", []))
+    if tools:
+        sections.append(f"Available tools: {tools}.")
+    sections.append(f"Working directory: {context.get("workspace", WORKDIR)}")
 
     # オンデマンド — 実際の状態に基づく、キーワードではない
     memories = context.get("memories", "")

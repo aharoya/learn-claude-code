@@ -136,7 +136,7 @@ def compact_history(messages):
 
 API がまだ `prompt_too_long`（413）を返すことがある。コンテキストの増加速度が圧縮のトリガー速度を上回る場合。
 
-この時 **reactive_compact** がトリガーされる：compact_history よりもさらに積極的だが、末尾を残す際も孤立した `tool_result` を残さないようにする。
+この時 **reactive_compact** がトリガーされる。トリガー方式は compact_history より積極的（413 エラー後の緊急対応）だが、圧縮方針はより温和で、末尾約 5 件のメッセージを保持し、早期の履歴だけを要約する。孤立した `tool_result` を残さないよう配慮する。
 
 ```python
 def reactive_compact(messages):

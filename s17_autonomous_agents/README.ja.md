@@ -195,15 +195,15 @@ if len(messages) <= 3:
 | コンポーネント | 変更前 (s16) | 変更後 (s17) |
 |--------------|------------|------------|
 | タスク割り当て | Lead が手動 assign | チームメイトが自動認領（can_start で依存確認） |
-| チームメイト状態 | WORK または終了 | WORK → IDLE（60s ポーリング） → SHUTDOWN |
+| チームメイト状態 | WORK → IDLE（1s 間隔で inbox をポーリング）→ WORK / SHUTDOWN | WORK → IDLE（5s 間隔で inbox + タスクボードをポーリング、60s タイムアウト）→ WORK / SHUTDOWN |
 | claim_task | owner チェックなし | 既に owner があるタスクを拒否 |
-| IDLE フェーズシャットダウン | shutdown_request を処理しない | 即座にシャットダウンをディスパッチして終了 |
-| Lead inbox | 印刷のみ、コンテキストに入らない | consume_lead_inbox で history に注入 |
-| 新規関数 | — | idle_poll, scan_unclaimed_tasks, consume_lead_inbox |
+| IDLE フェーズシャットダウン | shutdown_request を受信後に終了 | 即座にシャットダウンをディスパッチして終了 |
+| Lead inbox | consume_lead_inbox がプロトコル応答をルーティングしコンテキストに注入 | consume_lead_inbox 機構を踏襲 |
+| 新規関数 | consume_lead_inbox は既存 | idle_poll, scan_unclaimed_tasks（consume_lead_inbox を踏襲） |
 | 身份保持 | system prompt のみ | 圧縮後に自動再注入 |
-| Lead ツール | 14 (s16) | 14（変更なし） |
+| Lead ツール | 14 | 14（変更なし） |
 | チームメイトツール | 5 | 8（+ list_tasks, claim_task, complete_task） |
-| チームメイト終了条件 | タスク完了後即終了 | 60s アイドルタイムアウト後のみ終了 |
+| チームメイト終了条件 | WORK 完了後 IDLE に入り、shutdown_request を待って終了（タイムアウトなし） | 60s アイドルタイムアウトまたは shutdown_request 受信で終了 |
 
 ---
 
