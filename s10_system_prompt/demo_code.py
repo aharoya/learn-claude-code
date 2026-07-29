@@ -365,6 +365,14 @@ if __name__ == "__main__":
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
     # 启动时初始化 context
+    # context的结构是：
+    # {
+    #     "enabled_tools": list(TOOL_HANDLERS.keys()),
+    #     "workspace": str(WORKDIR),
+    #     "memories": memories,
+    # }
+    # update_context()这个函数是重新构建context，和历史context以及messages并没有关系，函数入参并没有用到
+    # 但是在单轮agent_loop中context是有用到的，用来动态构建system_prompt
     context = update_context({}, [])
     while True:
         try:
