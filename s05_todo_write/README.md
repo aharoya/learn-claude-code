@@ -109,6 +109,59 @@ Agent 收到任务后的典型流程：先调 `todo_write` 列出所有步骤（
 
 ---
 
+## 注意事项
+
+### 1. Todo 是内存存储，程序退出即丢失
+
+```python
+CURRENT_TODOS: list[dict] = []
+```
+
+教学版的 todo 存在全局变量中。程序重启后 todos 归零。s12 的 Task 系统才是持久化的。CC 的 Task 系统（V2）用文件持久化（`~/.claude/tasks/{taskListId}/{id}.json`），跨会话保留。
+
+### 2. nag 提醒是简单的轮次计数器
+
+```python
+if rounds_since_todo >= 3:
+    messages.append({"role": "user",
+                     "content": "<reminder>Update your todos.</reminder>"})
+```
+
+连续 3 轮没调用 todo_write 就注入提醒。但这里的问题是：如果 todo 已经全部 completed 了，注入了也没意义。CC 没有这种 nag 机制——Task 系统靠 LLM 自主决定何时更新。
+
+### 3. 全量替换而非增量更新
+
+```python
+CURRENT_TODOS = todos  # 直接替换整个列表
+```
+
+每次 `todo_write` 调用都是全量替换。LLM 必须每次把完整列表传回来。如果 LLM 传漏了某项（不小心忘记了），那项就丢了。CC 的 TaskUpdate 支持增量操作（只更新 status、只添加 blockedBy）。
+
+### 4. _normalize_todos 兼容多种格式但可能误解析
+
+```python
+if isinstance(todos, str):
+    try:
+        todos = json.loads(todos)
+    except json.JSONDecodeError:
+        try:
+            todos = ast.literal_eval(todos)
+```
+
+LLM 可能会以 Python 表示法（`[{"content": "...", "status": "pending"}]`）而非 JSON 传入参数。`ast.literal_eval` 可以解析这种情况，但如果字符串包含用户输入中的危险内容（如 `__import__('os').system('rm -rf /')`），`literal_eval` 会拒绝执行——这是安全的，但可能返回令人困惑的错误消息。
+
+### 与官方 Claude Code 对比
+
+| 方面 | 教学版 s05 | 官方 Claude Code |
+|------|-----------|-----------------|
+| 存储 | 内存（全局变量） | 文件持久化 `.tasks/*.json` |
+| 更新方式 | 全量替换 | 增量更新（TaskUpdate） |
+| 提醒机制 | nag 计数器（>=3 轮注入提醒） | 无 nag，LLM 自主更新 |
+| 状态数量 | 3（pending/in_progress/completed） | 3 + activeForm + metadata |
+| 依赖管理 | 无 | blockedBy + blocks DAG |
+
+---
+
 ## 试一下
 
 ```sh

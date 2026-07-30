@@ -197,6 +197,52 @@ for block in response.content:
 
 ---
 
+## 注意事项
+
+### 1. 事件点有限，不是完整的生命周期
+
+教学版定义了 4 个事件（UserPromptSubmit / PreToolUse / PostToolUse / Stop）。CC 的 hook 系统有更多事件点：`beforeQuery`、`afterQuery`、`beforeToolUse`、`afterToolUse`、`onStreamChunk`、`onError`、`onShutdown` 等，覆盖 Agent 的完整生命周期。
+
+### 2. 任一 hook 返回非 None 即拦截，不支持组合
+
+```python
+def trigger_hooks(event, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:  # 第一个非 None 就返回
+            return result
+    return None
+```
+
+教学版执行所有 hook 但只返回第一个非 None 的值——这意味着后面的 hook 即使返回了内容也被丢弃。CC 支持 hook 的"投票"模式：所有 hook 都运行，结果汇总后由框架决定。
+
+### 3. hook 全部是同步的
+
+所有回调函数都是普通函数，不能 await。如果某个 hook 需要异步操作（读取文件、发起 API 请求），教学版不支持。CC 的 hook 支持 async/await。
+
+### 4. Stop Hook 的 force 机制可能造成幻觉
+
+```python
+force = trigger_hooks("Stop", messages)
+if force:
+    messages.append({"role": "user", "content": force})
+    continue  # 强制继续循环
+```
+
+Stop Hook 返回内容会让 agent_loop 继续而不是退出。这个机制设计上是让 hook 能"补充最后一轮提示"。但如果 hook 实现不当（返回了不合理的指令），LLM 可能会基于这个凭空插入的 user 消息产生幻觉。
+
+### 与官方 Claude Code 对比
+
+| 方面 | 教学版 s04 | 官方 Claude Code |
+|------|-----------|-----------------|
+| 事件数量 | 4 个事件点 | 更多生命周期事件 |
+| 拦截机制 | 第一个非 None 即返回 | 投票模式 + 汇总决策 |
+| 异步支持 | 无（同步回调） | 支持 async/await |
+| Hook 注册 | register_hook() | settings.json + 配置或编程式注册 |
+| Stop 干预 | Hook 可 force 继续循环 | 支持但实现更严谨 |
+
+---
+
 ## 试一下
 
 ```sh

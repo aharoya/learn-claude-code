@@ -193,6 +193,51 @@ Agent 没干等，npm install 跑后台的时候，它去读了配置文件。
 
 ---
 
+## 注意事项
+
+### 1. 占位 tool_result 破坏了配对语义
+
+之前章节每个 `tool_use` 对应一个真实的 `tool_result`。s13 的后台路径是：`tool_use` 立即返回 `"[Background task bg_0001 started]"`（假结果），真正的结果在下一轮以 `<task_notification>` text block 注入。LLM 需要理解这个"两段式"通信协议：
+
+```
+Turn 1: tool_use(bash) → tool_result("[Background task bg_0001 started]")
+Turn 2: text(<task_notification>...bg_0001 completed...</task_notification>)
+```
+
+### 2. daemon=True 意味着后台任务可能被强杀
+
+```python
+thread = threading.Thread(target=worker, daemon=True)
+```
+
+用户 Ctrl+C 退出程序时，正在后台跑的 `pip install` 或 `npm build` 会被**直接杀掉**，不会有任何清理流程。生产环境需要 `threading.Event` 或进程级生命周期管理来做优雅关闭。
+
+### 3. 后台任务不是持久化的
+
+`background_tasks` / `background_results` 是内存字典，进程重启就丢了。如果 Agent 正在后台跑 `npm install` 时程序异常退出，重启后没有任何记录知道这个任务曾经存在过。
+
+### 4. 无线程池，每来一个任务就起一个新线程
+
+无限创建 `threading.Thread`，理论上可能因并发数过高耗尽系统资源。生产环境应该用 `concurrent.futures.ThreadPoolExecutor` 或 `Semaphore` 限制最大并发数。
+
+### 5. 后台线程的异常不会抛回主线程
+
+```python
+def worker():
+    result = execute_tool(block)  # 如果这里抛异常
+    # 下面两行永远不会执行
+    with background_lock:
+        background_tasks[bg_id]["status"] = "completed"
+```
+
+Python 线程中未捕获的异常不会抛回主线程，任务会停留在 `status="running"` 状态，永远不会被 `collect_background_results` 收集。技术上来讲应该在 `worker()` 里加 `try/except` 包住 `execute_tool`。但 s13 的 `run_bash` / `run_read` / `run_write` 内部都有 `try/except`，所以主路径是安全的。
+
+### 6. 通知只在每轮 agent_loop 末尾收集
+
+`collect_background_results` 只在 agent_loop 的每轮末尾执行。如果 agent_loop 已经返回、用户在等下一轮输入时后台才完成，通知需要等到用户输入下一句话、进入新一轮 agent_loop 才会被收集——不会"即时弹出来"。
+
+---
+
 ## 试一下
 
 ```sh

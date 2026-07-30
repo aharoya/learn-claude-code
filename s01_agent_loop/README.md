@@ -111,6 +111,44 @@ def agent_loop(messages):
 
 ---
 
+## 注意事项
+
+### 1. 同步循环，不是异步事件驱动
+
+教学版是简单的 `while True` 同步循环。真实 CC 运行在 Node.js 事件循环上（`query.ts`），`client.messages.create()` 调用会 `await`，后台任务通过通知队列（`messageQueueManager.ts`）异步注入结果。
+
+### 2. TOOLS 一次性静态定义
+
+教学版 `TOOLS` 列表在启动时定义，运行时不变。CC 的工具有 `shouldDefer` 机制——部分工具（如 `TaskCreate`）的 schema 不在初始请求中发送，只在需要时通过 ToolSearch 动态加载。这减少了每次 LLM 调用的 token 消耗。
+
+### 3. 没有 stop_reason 之外的退出条件
+
+教学版的循环只检查 `stop_reason != "tool_use"` 退出。CC 还有 token 预算限制（`max_tokens` 达到上限）、重试次数耗尽、用户取消等退出路径。
+
+### 4. SYSTEM 是静态字符串
+
+```python
+SYSTEM = f"You are a coding agent at {os.getcwd()}..."
+```
+
+s01 的 SYSTEM 提示词在启动时构建后就固定了。CC 的 SYSTEM 提示词在运行时动态组装（s10 的主题），包含工具列表、工作目录、用户偏好等，且在每次 LLM 调用前可能刷新。
+
+### 5. run_bash 包含黑名单但未经权限系统
+
+s01 的 `run_bash` 内部硬编码了危险命令黑名单。这个设计在 s03 会被移除——安全逻辑不属于工具函数，属于运行环境。CC 的安全策略完全在工具执行层之外（permission hooks + settings.json 配置）。
+
+### 与官方 Claude Code 对比
+
+| 方面 | 教学版 s01 | 官方 Claude Code |
+|------|-----------|-----------------|
+| 循环模型 | 同步 `while True` | 异步事件循环 + await |
+| 工具注册 | 启动时静态定义 | 动态加载（shouldDefer + ToolSearch） |
+| SYSTEM 提示词 | 静态字符串 | 运行时组装 + 缓存 |
+| 退出条件 | 仅 stop_reason | stop_reason + token 预算 + 取消信号 |
+| 安全 | 函数内黑名单 | 独立的 permissions 层 + settings.json 配置 |
+
+---
+
 ## 试一下
 
 > **教学 demo 提示**：代码会执行模型生成的 shell 命令。建议在一个临时测试目录中运行，避免影响你的项目文件。s03 会讲真正的权限系统。

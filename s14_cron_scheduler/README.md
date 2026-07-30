@@ -227,6 +227,183 @@ def schedule_job(cron, prompt, recurring=True, durable=True):
 
 ---
 
+## 注意事项
+
+### 1. 四层解耦：调度器不关心 Agent 忙不忙
+
+```
+Scheduler → Queue → Queue Processor → Consumer
+```
+
+整个 cron 系统拆成四个独立角色，各管各的：
+
+| 层 | 职责 | 只看什么 |
+|---|------|---------|
+| Scheduler | `cron_matches` 匹配时间 | 当前时间、cron 表达式 |
+| Queue | `cron_queue` 列表 | 什么也不看，只是"筐" |
+| Queue Processor | 队列非空 + Agent 空闲 → 拉起 agent_loop | 队列长度、agent_lock |
+| Consumer（agent_loop） | 消费队列 → [Scheduled] 注入 messages | 队列内容 |
+
+**好处**：每层的逻辑简单，改一层不影响其他层。比如想改成每 5 秒检查一次，只改 `cron_scheduler_loop` 里的 `time.sleep(1)` 就行。
+
+**代价**：从触发到执行有延迟窗口。`cron_matches` 为 True 的时间点 ≠ Agent 实际处理的时间点。如果 Agent 正在忙，队列会积压。
+
+### 2. agent_lock：用户优先于 cron
+
+```python
+# 用户输入：阻塞等待锁（用户必须等到）
+with agent_lock:
+    run_agent_turn_locked(query)
+
+# cron 触发：不阻塞，锁被占就跳过
+if agent_lock.acquire(blocking=False):
+    try:
+        run_agent_turn_locked()
+    finally:
+        agent_lock.release()
+```
+
+**关键区别**：
+- `with agent_lock` 会**阻塞等待**，拿不到锁就等着，直到拿到为止
+- `acquire(blocking=False)` **不等待**，拿不到就返回 False，直接跳过
+
+用户交互期间 cron 任务不会打断——cron 是"后台任务"，用户输入是"前台任务"。如果用户连续输入 10 分钟，cron 任务就在队列里等 10 分钟。**cron 的触发时间是"最早可用时间"，不是精确时间。**
+
+**Python 语法说明**：`with agent_lock:` 是 `lock.acquire()` + `try: ... finally: lock.release()` 的简写。`acquire(blocking=False)` 是"尝试获取锁，拿不到就算了"（不阻塞当前线程）。这两个是 Python `threading.Lock` 的标准用法。
+
+### 3. `_last_fired` 用完整日期时间防止重复触发
+
+```python
+minute_marker = now.strftime("%Y-%m-%d %H:%M")
+```
+
+为什么不能只存 "HH:MM"？
+
+**场景**：`*/5` 任务（每 5 分钟执行一次）在 `9:05:01` 触发，Agent 花了 3 分钟处理到 `9:08`。此时调度器又检查了：当前分钟是 9:05 还是匹配的！如果没有日期前缀，`_last_fired` 里已经存了 `"09:05"`，你没法判断这个 `"09:05"` 是今天 9:05 还是昨天 9:05。
+
+实际上更直接的 bug：如果只存 `"09:05"`，第二天 9:05 发现 `_last_fired["job_x"]` 还是 `"09:05"`，以为已经触发过了，**跳过**。任务永远不再触发。
+
+日期前缀（`"2026-07-30 09:05"` ≠ `"2026-07-31 09:05"`）彻底解决了跨天问题。
+
+### 4. DOM 和 DOW 是 OR 语义（Unix 标准 cron）
+
+```python
+# "0 9 15 * 1" → 每月15号 OR 每周一 的 9:00
+if dom_ok or dow_ok:
+    return True
+```
+
+很多人以为 `"0 9 15 * 1"` 是"每月 15 号**且是**周一才触发"。实际上标准 Unix cron 的 DOM 和 DOW 是 **OR**——15 号不是周一也触发，每周一也触发。
+
+如果 15 号是周二，这个表达式会在：每月 15 号（周二）+ 每个周一，一个月触发 5-6 次。要表达"15 号且是周一"需要额外逻辑，教学版不支持。
+
+**判断逻辑拆解**：
+1. 分钟、小时、月份必须全部匹配（AND）
+2. DOM 和 DOW：如果两者都没约束（都是 `*`）→ 匹配
+3. 只有一个约束了 → 只看那个
+4. 两个都约束了 → 任一匹配即可（OR）
+
+### 5. 一次性任务在调度线程里删除，不在 Consumer 里删
+
+```python
+if cron_matches(job.cron, now):
+    if _last_fired.get(job.id) != minute_marker:
+        cron_queue.append(job)
+    if not job.recurring:
+        scheduled_jobs.pop(job.id, None)      # ← 调度线程里删
+        if job.durable:
+            save_durable_jobs()
+```
+
+一次性任务（`recurring=False`）在**调度线程匹配时就删了**，不是等到 `consume_cron_queue` 消费时才删。这意味着即使队列中的一次性任务还没被 Agent 执行，它也不会再次触发。
+
+**边界情况**：删除操作（`scheduled_jobs.pop` → `save_durable_jobs`）分两步走，中间可能崩溃。如果 `pop` 成功了但 `save_durable_jobs` 还没写磁盘就崩溃了，`.scheduled_tasks.json` 里还有这个任务。下次启动重新加载，任务回来了——但 `_last_fired` 是内存变量，丢了。所以任务会**再触发一次**。这不算大问题（一次性任务多触发一次），但如果你需要精确的一次性语义，需要考虑这个边界。
+
+### 6. Double-check：获取锁的间隙队列可能已被消费
+
+```python
+if not agent_lock.acquire(blocking=False):
+    continue       # ← 队列有货但 Agent 忙，跳过
+try:
+    if not has_cron_queue():   # ← 这步是 double-check
+        continue               # ← 队列已经空了，跳过
+    run_agent_turn_locked()
+finally:
+    agent_lock.release()
+```
+
+为什么 `has_cron_queue()` 要检查两次？
+
+时间线：
+```
+T0: queue_processor 检查 has_cron_queue() = True（有工作）
+T1: 用户输入触发的 agent_loop 执行了 consume_cron_queue，队列空了
+T2: queue_processor.acquire(blocking=False) = True（拿到锁了）
+T3: 如果不 double-check，直接调 run_agent_turn_locked ≡ 跑一轮空的 agent_loop
+```
+
+你拿到锁不代表队列里的东西还在。两个锁（`agent_lock` 和 `cron_lock`）是独立的，获取 `agent_lock` 的间隙，另一条路径可能已经消费了队列。这就是 double-check pattern 的必要性。
+
+### 7. cron 任务积压：一次性注入可能淹没 LLM
+
+```python
+fired = consume_cron_queue()  # 取出所有积压任务
+for job in fired:
+    messages.append({"role": "user", "content": f"[Scheduled] {job.prompt}"})
+```
+
+如果用户 10 分钟没交互，积压了 30 个定时任务，这 30 条 `[Scheduled]` 消息一次性全部注入到 messages 里。LLM 看到一堆 `[Scheduled]` 可能混乱，也可能超出 token 预算。
+
+CC 的做法是按队列优先级区分（`priority: 'later'` + `workload: WORKLOAD_CRON`），API 容量紧张时降低 cron 请求的 QoS。教学版没有这个机制。
+
+### 8. Daemon 线程：主线程退出时强制杀死
+
+```python
+threading.Thread(target=cron_scheduler_loop, daemon=True).start()
+threading.Thread(target=queue_processor_loop, daemon=True).start()
+```
+
+`s14` 启动后，后台总共有 3 个线程并行运行：
+- **主线程**：`input()` 等待用户输入
+- **cron_scheduler_loop**：每秒检查时间
+- **queue_processor_loop**：每 0.2 秒检查队列
+
+加上 s13 的后台 worker 线程（`start_background_task` 每次调用创建一个），线程数更多。
+
+**daemon=True 的含义**：主线程退出时，这些线程会被**强制杀死**，不管它们是否在执行关键操作。好处是程序按 Ctrl+C 退出不用等它们慢慢关。坏处是：
+- `save_durable_jobs()` 可能写到一半就被杀，`.scheduled_tasks.json` 写半截变乱码
+- 后台 worker 正在 `execute_tool` 时被杀死，结果丢失
+
+教学版不考虑 graceful shutdown。production 版本需要信号处理（`signal.SIGINT`/`SIGTERM`）让线程有机会收尾。
+
+### 9. 持久化只存任务定义，不停 Agent 进程
+
+```python
+def save_durable_jobs():
+    durable = [asdict(j) for j in scheduled_jobs.values() if j.durable]
+    DURABLE_PATH.write_text(json.dumps(durable, indent=2))
+```
+
+**重要前提**：cron 调度器在 Agent **进程内**跑。进程关闭，调度也停。`durable=True` 只保证"下次启动时任务定义还在"，不保证"关闭期间也能定时触发"。
+
+如果你希望"即使应用关闭，每天早上 9 点也跑任务"，请用系统 crontab 或 Windows Task Scheduler。
+
+### 与官方 Claude Code 对比
+
+| 方面 | 教学版 s14 | 官方 Claude Code |
+|------|-----------|-----------------|
+| 任务数量上限 | 无限制（可能导致内存泄漏） | 50 个上限（`MAX_JOBS = 50`） |
+| 自动过期 | 无（必须手动 cancel） | 重复任务 7 天后自动过期（可配到 30 天） |
+| 抖动（防惊群） | 无（同一秒触发所有匹配任务） | 确定性哈希抖动，触发延迟 ±10%（上限 15 分钟） |
+| 文件锁 | 无（多个 session 可重复触发同一任务） | `.scheduled_tasks.lock` 防多 session 冲突 |
+| 任务优先级 | 全部一视同仁 | 队列优先级 + QoS 标签分类 |
+| Cron 语法 | `*/N`、`N-M`、`N,M,...` | 额外支持 `N-M/S`（跳步范围） |
+| 任务积压 | 一次性全部注入 messages | 按优先级分批 + 容量感知 |
+| 关闭处理 | daemon 线程直接杀 | 文件锁清理 + graceful shutdown |
+| 文件监听 | 无 | `chokidar` 监听 `scheduled_tasks.json` 变更 |
+
+---
+
 ## 试一下
 
 ```sh

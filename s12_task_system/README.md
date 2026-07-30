@@ -216,6 +216,56 @@ complete_task(tests.id)     # ✓ Completed
 
 ---
 
+## 注意事项
+
+### 1. claim_task 合并了认领和开始工作
+
+教学版的 `claim_task` 同时做了两件事：设置 owner + 把状态改为 `in_progress`。真实 CC 的 `claimTask` 只解决 owner 竞争（谁来做），状态更新由独立的 `TaskUpdate` 操作完成。教学版合为一步是为了减少工具数量，但也丢失了"认领了但还没开始做"的中间状态。
+
+### 2. 依赖检查是软约束
+
+`can_start` 只在 `claim_task` 时检查。但以下情况不会验证：
+- `create_task` 创建时不会检查 `blockedBy` 引用的任务 ID 是否存在（可以引用不存在的 ID）
+- `complete_task` 完成时不会检查它是否阻塞了谁（只报告，不阻止）
+- 依赖关系不可变——`blockedBy` 只能在创建时设置，无法事后修改
+
+### 3. 没有 DAG 环检测
+
+任务 A 声明 `blockedBy=[B]`、任务 B 声明 `blockedBy=[A]`，`can_start` 检查不会死循环，但两个任务都会永久阻塞。教学版为了保持简单，没有实现环检测。真实 CC 也没有——实践中 DAG 环很少出现，靠 Agent 的行为规范来避免。
+
+### 4. 状态只有单向流转
+
+```
+pending → in_progress → completed
+```
+
+没有 `in_progress → pending` 的 release 回退路径。如果认领任务的 Agent 崩溃了或放弃了，其他 Agent 没有办法重新认领——因为任务状态仍然是 `in_progress`，`claim_task` 会拒绝。真实 CC 有 unassign 机制：teammate 断开时清理 owner 并将状态重置为 `pending`。
+
+### 5. complete_task 的级联解锁是全量扫描
+
+```python
+unblocked = [t.subject for t in list_tasks()  # 扫描所有任务
+             if t.status == "pending" and t.blockedBy and can_start(t.id)]
+```
+
+每次完成任务都遍历 `.tasks/` 下所有 JSON 文件，O(n) 复杂度。数据量小无所谓，几千个任务时就会有性能问题。真实 CC 通过 `blocks` 字段（反向索引）直接找到被阻塞的下游任务，不需要全量扫描。
+
+### 6. 没有并发保护
+
+教学版是单 Agent 场景，不存在同时认领的竞争问题。多 Agent 场景中，两个 Agent 同时 `claim_task` 同一个任务会出问题：
+- A 读取文件 → status=pending
+- B 读取文件 → status=pending
+- A 写入 → status=in_progress, owner=agent_a
+- B 写入 → status=in_progress, owner=agent_b（覆盖了 A）
+
+真实 CC 用 `proper-lockfile` 做文件锁防止这种竞态（见"深入 CC 源码"章节）。
+
+### 7. 没有缓存，每次操作都读磁盘
+
+`list_tasks` / `get_task` / `can_start` / `claim_task` / `complete_task` 每次调用都重新从 `.tasks/*.json` 文件读取。如果同一轮 agent_loop 中多次调用 `list_tasks`，每次都走磁盘 I/O。教学代码不做优化是为了保持简单；生产环境应该在单个 agent_loop 内做一级内存缓存。
+
+---
+
 ## 试一下
 
 ```sh

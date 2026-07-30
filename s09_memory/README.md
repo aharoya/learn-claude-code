@@ -167,6 +167,101 @@ session memory 关注同一会话内的连续性：compact 之后，当前会话
 
 ---
 
+## 注意事项
+
+### 1. 记忆提取仅在 agent_loop 结束时触发
+
+```python
+if response.stop_reason != "tool_use":
+    extract_memories(pre_compress)  # 所有工具调用完成后才提取
+    consolidate_memories()
+    return
+```
+
+如果用户在对话中间说"记住这个偏好"，要等到 LLM 完成所有工具调用、给出最终回答后，才会写入记忆文件。**不是实时的**——在当前轮中 Agent 看不到刚刚"记住"的东西。
+
+### 2. pre_compress 快照是浅拷贝
+
+```python
+pre_compress = [m if isinstance(m, dict) else {"role": ..., "content": ...} for m in messages]
+```
+
+这层列表推导式只复制了消息列表的外层。如果消息的 `content` 是一个 list（含多个 tool_result block），那这个 list 对象仍然是引用。后续的压缩操作（`micro_compact` 等）在修改 `messages` 中的 `block["content"]` 时，可能同步影响到 `pre_compress` 中对应 block 的内容。不过在 s09 的流程中，压缩发生在快照之后，所以实际影响不大。
+
+### 3. select_relevant_memories 每次消耗一次 LLM 调用
+
+```python
+def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
+    ...
+    response = client.messages.create(model=MODEL, ...)  # side-query
+```
+
+每次 agent_loop 启动都额外调用一次 LLM 来判断记忆相关性。如果记忆文件多、`catalog` 很长，这次 side-query 的 token 消耗可能超过直接注入所有记忆的成本。这是"精确性"和"成本"之间的权衡。
+
+### 4. 关键词 fallback 只是子串包含判断
+
+```python
+keywords = [w.lower() for w in recent.split() if len(w) > 3]
+if any(kw in text for kw in keywords):  # 子串匹配
+```
+
+如果关键词 "test" 出现在记忆中，任何包含 "test" 的对话（"testing"、"tested"、"testability"）都会触发匹配。不是语义匹配，命中率不稳定。
+
+### 5. consolidate_memories 的先删后写策略
+
+```python
+# 清空所有旧记忆文件
+for f in MEMORY_DIR.glob("*.md"):
+    if f.name != "MEMORY.md":
+        f.unlink()
+# 再写回整理后的新记忆
+for mem in items:
+    write_memory_file(...)
+```
+
+旧文件删除后、新文件写入前，如果程序崩溃或 LLM 返回了不完整的 JSON，记忆会全部丢失。注释说"清空发生在 LLM 调用成功后"——这个"成功"只意味着 API 返回了 200，不意味着返回的内容是有效的。如果 LLM 返回了 `[]`（空数组）但解析成功了，所有记忆都会被清除。
+
+### 6. subagent 看不到父 Agent 的记忆
+
+```python
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Complete the task you were given, then return a concise summary."
+    # 没有记忆索引
+)
+SUB_TOOLS = [...]  # 只有 bash/read/write，没有 task 工具
+```
+
+子 Agent 使用独立的 `SUB_SYSTEM`（不含记忆索引）和受限的工具集（没有 `edit_file`/`glob`/`task`）。这是有意的设计——记忆属于父 Agent——但也意味着子 Agent 不知道用户的偏好（比如"用 4 空格缩进"），可能生成不符合用户习惯的代码。
+
+### 7. agent_loop 内 SYSTEM 不会刷新
+
+```python
+system = build_system()  # while True 前调用一次
+while True:
+    ...
+    response = client.messages.create(model=MODEL, system=system, ...)
+    ...
+```
+
+SYSTEM 提示词在 while 循环外构建，循环内即使有新记忆写入也不会更新 SYSTEM。不过在实际流程中，`extract_memories` 在 agent_loop 结束时才调用，所以循环内本来就不会有新记忆产生，这个问题不存在。
+
+### 8. memory_turn 在压缩后可能指向错误位置
+
+```python
+memory_turn = len(messages) - 1  # 记录当前 user 消息的位置
+...
+messages[:] = snip_compact(messages)  # 可能裁剪消息
+messages[:] = micro_compact(messages)  # 可能修改消息
+...
+if memory_turn is not None and memory_turn < len(messages):
+    request_messages[memory_turn]["content"] = memories_content + ...  # 注入记忆
+```
+
+压缩（`snip_compact`）可能删掉前面的消息，但 `memory_turn` 索引值没有更新。代码用 `memory_turn < len(messages)` 做了越界保护，但如果索引不再指向正确的用户消息，记忆会注入到错误的位置（比如注入到一条 assistant 消息前面）。
+
+---
+
 ## 试一下
 
 ```sh

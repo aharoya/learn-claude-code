@@ -173,6 +173,66 @@ def agent_loop(messages, context):
 
 ---
 
+## 注意事项
+
+### 1. lambda 闭包捕获的是变量引用，不是值
+
+```python
+lambda: client.messages.create(
+    model=state.current_model,  # ← 引用 state 对象的 current_model 属性
+    ...)
+```
+
+这里 `state.current_model` 在每次 `fn()` 被调用时才取值。如果 `with_retry` 内部切换了模型（连续 529 触发降级），后续重试时 `fn()` 会自动使用新模型。如果写成 `model=state.current_model` 的默认参数 `lambda mdl=state.current_model:`，则模型降级不会生效——lambda 创建时就把模型 ID 固定了。这一点在前面修复时已经确认过。
+
+### 2. with_retry 重试耗尽后不会尝试其他恢复路径
+
+`with_retry` 对 429/529 最多重试 10 次。10 次后抛出 `RuntimeError("Max retries (10) exceeded")`，这个错误被外层 `try/except` 捕获并走 Path 3（不可恢复错误 → 直接退出 agent_loop）。**不会降级到 reactive_compact 或 max_tokens 升级**——这些路径只处理 LLM 返回的 stop_reason，不处理 API 调用异常。
+
+### 3. reactive_compact 是暴力截断，不是智能压缩
+
+```python
+def reactive_compact(messages: list) -> list:
+    tail = messages[-5:]
+    return [{"role": "user",
+             "content": "[Reactive compact] ..."}, *tail]
+```
+
+真正的 Claude Code 会调用 LLM 对前半部分做摘要后保留知识；教学版直接丢掉前面所有消息，只保留最后 5 条。如果 compact 后 LLM 需要之前的工具执行结果（比如刚才读文件的内容），已经看不到了。**这是应急手段，不是正常的上下文管理。**
+
+### 4. RecoveryState 每轮 agent_loop 新建，不跨轮持续
+
+```python
+def agent_loop(messages: list, context: dict):
+    state = RecoveryState()  # 每轮新建
+```
+
+上一轮如果因为 `max_tokens` 截断升级到了 64K，本轮又回到 8K 重新开始。这在设计上是合理的（每轮独立），但如果你连续输入两条长回复，第二条不会继承第一条的已升级状态，可能重复走升级流程。
+
+### 5. max_tokens 升级到 64K 后不会降回来
+
+一旦触发 `max_tokens` 升级到 64K，后续的所有 LLM 调用（即使输出很短）都用 64K 请求。这会让 API 成本高于必要值。教学代码没有"连续 N 次不截断后降回 8K"的机制。
+
+### 6. 模型降级后不会切回主模型
+
+```python
+if state.consecutive_529 >= MAX_CONSECUTIVE_529:
+    state.current_model = FALLBACK_MODEL  # 切换后就固定了
+    state.consecutive_529 = 0
+```
+
+切到 `FALLBACK_MODEL` 后，即使后续全部调用成功，也继续用降级模型。教学代码没有"监测到服务正常后切回主模型"的自动恢复机制。
+
+### 7. retry_delay 的 retry_after 参数未被调用
+
+`retry_delay` 函数签名包含 `retry_after=None` 参数，支持 API 返回的 `Retry-After` 头（服务端建议的等待时间）。但在 `with_retry` 中调用时只传了 `retry_delay(attempt)`，没有传 `retry_after`。如果 API 返回了明确的等待时长建议，教学代码会忽略它，仍然用自己的指数退避算法。
+
+### 8. Anthropic SDK 自身也有重试机制
+
+`from anthropic import Anthropic` 客户端默认对 429/529 等错误有内置的重试（默认重试 2 次）。教学代码又包了一层自己的 `with_retry`（最多 10 次）。两层重试叠加，实际等待时间可能比预期的更长。生产环境通常要么依赖 SDK 内置重试，要么自己实现——不会两者都用。
+
+---
+
 ## 试一下
 
 ```sh

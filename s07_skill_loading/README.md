@@ -116,6 +116,54 @@ def load_skill(name: str) -> str:
 
 ---
 
+## 注意事项
+
+### 1. SKILL_REGISTRY 是只读的，运行时不能添加
+
+```python
+_scan_skills()  # 启动时扫描一次
+# 之后 SKILL_REGISTRY 不再变化
+```
+
+教学版在启动时扫描 `skills/` 目录，之后注册表就固定了。如果运行时新增了技能文件，需要重启进程才能生效。CC 的技能系统支持动态添加/卸载，通过 `install` 和 `remove` 操作管理。
+
+### 2. Layer 1 技能目录是固定的，不会跟随对话动态调整
+
+```python
+SYSTEM = build_system()  # 启动时构建一次
+```
+
+`SYSTEM` 在启动时构建后就固定了。如果 LLM 在当前对话中频繁使用某个技能，Layer 1 的目录不会调整优先级或移除已使用的技能。`s10` 的 `update_context` 解决了这个问题——SYSTEM 提示词根据运行时状态动态刷新。
+
+### 3. load_skill 内容注入 tool_result，没有独立上下文隔离
+
+技能内容通过 `tool_result` 返回给 LLM，和普通的工具调用结果一样放在 messages 中。LLM 在处理复杂任务时可能忽略大段的技能内容。CC 的技能注入方式更灵活——可以注入到 system prompt 或作为独立的上下文块。
+
+### 4. 子 Agent 不能加载技能
+
+```python
+SUB_TOOLS = [...]  # 没有 load_skill
+```
+
+子 Agent 没有 `load_skill` 工具。如果子 Agent 在任务中需要技能知识，父 Agent 需要在 task description 中传递相关信息。CC 的 subagent 可以选择性地继承父 Agent 的部分技能上下文。
+
+### 5. 没有技能版本管理
+
+教学版 `skills/` 目录中每个技能只有一个 `SKILL.md` 文件，覆盖写就丢失旧版本。CC 的技能更新通过 git 管理。
+
+### 与官方 Claude Code 对比
+
+| 方面 | 教学版 s07 | 官方 Claude Code |
+|------|-----------|-----------------|
+| 动态加载 | 仅启动时扫描 | 运行时动态添加/卸载 |
+| SYSTEM 集成 | 启动时一次性构建 | 运行时按需组装（s10） |
+| 技能内容注入 | tool_result（同普通工具） | 多种注入方式（system/message） |
+| 子 Agent | 不能加载技能 | 可选择性继承技能上下文 |
+| 版本管理 | 无 | git 跟踪 |
+| 注册表安全 | 路径遍历防护 | 注册表 + 签名验证 |
+
+---
+
 ## 试一下
 
 ```sh

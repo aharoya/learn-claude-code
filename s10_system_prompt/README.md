@@ -171,6 +171,59 @@ def agent_loop(messages: list, context: dict):
 
 ---
 
+## 注意事项
+
+### 1. update_context 的参数暂时未使用
+
+```python
+def update_context(context: dict, messages: list) -> dict:
+```
+
+`context` 和 `messages` 两个入参在函数体内都没有被读取——函数每次都重新构建一个新 dict 返回。这是因为当前版本的状态推导足够简单（`TOOL_HANDLERS.keys()` + `MEMORY_INDEX.exists()`），不需要依赖历史数据。参数保留是为了后续扩展：比如未来需要根据 `messages` 分析对话阶段，或者根据 `context` 做增量更新。
+
+### 2. 缓存是进程内的，不是跨轮的
+
+```python
+_last_context_key = None
+_last_prompt = None
+```
+
+缓存用全局变量存储。当前 agent_loop 轮次内 context 不变时命中缓存，但换了一轮（新用户输入）后如果 context 变了就失效。没有持久化到磁盘或跨会话共享。
+
+### 3. PROMPT_SECTIONS 只存了 identity，不是真正的片段系统
+
+当前代码中 `PROMPT_SECTIONS` 字典只有 `"identity"` 一个 key：
+
+```python
+PROMPT_SECTIONS = {
+    "identity": "You are a coding agent. Act, don't explain.",
+}
+```
+
+`tools` 和 `workspace` 的拼接逻辑直接在 `assemble_system_prompt` 里硬编码了，不是从 `PROMPT_SECTIONS` 取的。README 中说"按主题分段的提示词片段字典"更像设计目标而不是当前实现——新增一个片段（比如描述 Agent 的角色）仍然需要改 `assemble_system_prompt` 函数本身。
+
+### 4. 缓存 key 包含整个 context，任何变化都会失效
+
+```python
+key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
+```
+
+如果未来 context 里加了每次调用都变化的字段（比如 `tool_call_count`、`request_id`），缓存会永远不命中。`sort_keys=True` 保证了键顺序一致，但无法筛选"哪些字段变化值得重新组装"。
+
+### 5. memory 判断可能过度依赖文件存在性
+
+```python
+memories = ""
+if MEMORY_INDEX.exists():
+    content = MEMORY_INDEX.read_text().strip()
+    if content:
+        memories = content
+```
+
+文件不存在 → 不注入记忆片段；文件存在且有内容 → 注入全部内容。但如果 MEMORY.md 虽然存在但内容与上一轮完全相同，context 中的 `memories` 字段值不变，所以缓存仍然命中——这其实是正确的行为。
+
+---
+
 ## 试一下
 
 ```sh

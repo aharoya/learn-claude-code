@@ -132,6 +132,52 @@ for block in response.content:
 
 ---
 
+## 注意事项
+
+### 1. TOOL_HANDLERS 是简单查表，不是完整的工具注册系统
+
+```python
+TOOL_HANDLERS = {
+    "bash": run_bash, "read_file": run_read, ...
+}
+```
+
+教学版用 dict 做工具名→函数的映射。CC 的每个工具是独立的类（`BashTool.tsx`、`ReadTool.tsx`），有自己的 schema 生成、参数校验、权限声明、并发安全控制。
+
+### 2. 没有并发工具执行
+
+教学版遍历 `response.content` 逐个执行工具。CC 支持并发工具调用——如果 LLM 一次返回多个 `tool_use`，标记为 `isConcurrencySafe: true` 的工具可以同时执行。
+
+### 3. safe_path 是简单的路径检查
+
+```python
+path = (WORKDIR / p).resolve()
+if not path.is_relative_to(WORKDIR):
+    raise ValueError(...)
+```
+
+教学版只检查路径是否在工作目录内。CC 的工作目录管理更复杂——支持多项目（`projects` 配置）、git worktree 隔离（s18 的内容）、符号链接解析等。
+
+### 4. `handler(**block.input)` 是一键展开，不校验参数
+
+```python
+output = handler(**block.input)
+```
+
+教学版直接展开 block.input 的所有 key 作为函数参数。如果 LLM 传了 schema 之外的参数（比如 bash 传了 `run_in_background`），会导致 `TypeError`。CC 的每个 Tool 类有独立的参数校验层。
+
+### 与官方 Claude Code 对比
+
+| 方面 | 教学版 s02 | 官方 Claude Code |
+|------|-----------|-----------------|
+| 工具实现 | 普通函数 + dict 映射 | 独立 Tool 类（BashTool/ReadTool 等） |
+| 工具注册 | 写死在 TOOLS + TOOL_HANDLERS | 声明式注册 + 自动 schema 生成 |
+| 并发执行 | 无（串行执行） | 支持 isConcurrencySafe |
+| 参数校验 | 无（**block.input 直接传） | 每个 Tool 独立校验 |
+| 路径安全 | simple safe_path | 多项目 + worktree + 符号链接触发器 |
+
+---
+
 ## 试一下
 
 ```sh

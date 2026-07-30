@@ -203,6 +203,92 @@ def agent_loop(messages):
 
 ---
 
+## 注意事项
+
+### 1. estimate_size 不精确，只是字符串长度
+
+```python
+def estimate_size(msgs):
+    return len(str(msgs))
+```
+
+`CONTEXT_LIMIT = 50000` 触发阈值是**字符数**，不是 token 数。中文一个字符 ≈ 1-2 token，英文一个词 ≈ 1-2 token。50000 字符在 Anthropic 模型（约 100K-200K token 上下文窗口）下通常是安全的，但这不是精确的预算计算。
+
+### 2. L4 compact_history 丢失所有 tool_result 细节
+
+```python
+def compact_history(messages):
+    summary = summarize_history(messages)
+    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+```
+
+整个对话历史被压缩成一条 LLM 摘要。之前的文件内容、命令输出、工具执行结果**全部丢失**——只保留摘要中 LLM 认为"重要"的部分。`write_transcript` 虽然保存了原始转录，但 LLM 不会自动去读它。如果后续 LLM 需要之前的具体输出（比如刚才 `npm list` 的包列表），摘要中没写就看不到了。
+
+### 3. messages 原地修改会影响调用方
+
+```python
+messages[:] = tool_result_budget(messages)   # 直接修改列表对象
+messages[:] = snip_compact(messages)
+messages[:] = micro_compact(messages)
+```
+
+整个压缩管道用 `messages[:] = ...` 原地修改。由于 `history` 和 `messages` 是同一个列表对象（主入口传的是 `history`），agent_loop 返回后 `history` 已经被压缩了。用户输入下一轮看到的是压缩后的历史，不是原始完整对话。
+
+### 4. micro_compact 直接修改原始 dict
+
+```python
+for _, _, block in tool_results[:-KEEP_RECENT]:
+    if len(block.get("content", "")) > 120:
+        block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
+```
+
+这不是替换 messages 中的消息，而是**直接修改 dict 对象的内容**。由于 dict 是可变对象，这个修改在 agent_loop 内外都可见。如果其他代码持有这个 block 的引用，看到的也是被修改后的内容。
+
+### 5. L3 只检查最新一条 user 消息
+
+```python
+last = messages[-1] if messages else None
+# 只处理最新的 tool_result 消息
+if not last or last.get("role") != "user" or not isinstance(last.get("content"), list):
+    return messages
+```
+
+`tool_result_budget` 只处理最新一轮的 tool_result。如果之前某轮有超大输出但当时没有触发 L3（比如那时还没达到阈值），后续的 L3 不会回头处理它。只有 snip/micro 能间接处理历史的大输出。
+
+### 6. L4 摘要的输入本身可能被截断
+
+```python
+conversation = json.dumps(messages, default=str)[:80000]
+```
+
+L4 触发时 messages 可能已经很大，`summarize_history` 只能看到前 80000 字符。如果对话历史超过 80000 字符，摘要本身就不完整——后半部分的对话信息完全丢失。
+
+### 7. compact 工具的 focus 参数未实际使用
+
+```python
+{"name": "compact", "description": "Summarize earlier conversation to free context space.",
+ "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}}
+```
+
+TOOLS 中为 `compact` 定义了 `focus` 参数，LLM 可以传"请重点关注数据库设计"。但在 `compact_history` 调用时没有传递 focus，无论 LLM 传了什么，摘要 prompt 是一样的。
+
+### 8. compact 不走 Hook，权限检查无法拦截
+
+```python
+if block.name == "compact":
+    messages[:] = compact_history(messages)
+    ...
+    break  # 直接 break 出 for 循环
+```
+
+compact 在 agent_loop 中特殊处理，不经过 `trigger_hooks("PreToolUse", block)`。如果 `permission_hook` 配置了拒绝 compact 调用，它不会生效。
+
+### 9. reactive_compact 只重试 1 次
+
+`MAX_REACTIVE_RETRIES = 1`。应急压缩后 API 再次失败就直接 raise 了，没有进一步降级。如果 LLM 摘要本身都超过上下文限制（极端情况：摘要也很长），程序会崩溃退出。
+
+---
+
 ## 试一下
 
 ```sh

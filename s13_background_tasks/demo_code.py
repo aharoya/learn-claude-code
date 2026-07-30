@@ -97,21 +97,49 @@ TASKS_DIR.mkdir(exist_ok=True)
 
 @dataclass
 class Task:
-    """任务数据类：id/subject/description/status/owner/blockedBy。"""
+    """任务数据类。
+
+    持久化为 .tasks/{id}.json 文件。
+    每个字段对应 JSON 文件中的一个键。
+
+    字段：
+      id：唯一标识符（格式：task_{timestamp}_{4位随机数}）
+      subject：任务标题
+      description：任务详细描述
+      status：任务生命周期状态（pending | in_progress | completed）
+      owner：认领者标识（单 Agent 为 "agent"，多 Agent 场景为 Agent 名）
+      blockedBy：依赖的任务 ID 列表——只有这些任务全部 completed 后才能开始
+    """
     id: str
     subject: str
     description: str
-    status: str          # pending | in_progress | completed
+    status: str
     owner: str | None
     blockedBy: list[str]
 
 
 def _task_path(task_id: str) -> Path:
+    """获取任务对应的 JSON 文件路径。
+
+    参数 task_id：任务 ID。
+    返回：.tasks/{task_id}.json 的 Path 对象。
+    """
     return TASKS_DIR / f"{task_id}.json"
 
 
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    """创建新任务并持久化到磁盘。
+
+    参数 subject：任务标题（必填）。
+    参数 description：任务描述（可选）。
+    参数 blockedBy：依赖的任务 ID 列表（可选），建立 DAG 边。
+
+    ID 包含时间戳 + 随机数以保证唯一性。
+    新任务始终从 pending 状态开始。
+
+    返回：创建的 Task 对象。
+    """
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject, description=description,
@@ -123,26 +151,54 @@ def create_task(subject: str, description: str = "",
 
 
 def save_task(task: Task):
+    """将任务对象序列化为 JSON 并写入磁盘。
+
+    使用 dataclass.asdict 转换。
+    文件路径由 _task_path 决定。
+    """
     _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
 
 
 def load_task(task_id: str) -> Task:
+    """从磁盘 JSON 文件加载任务对象。
+
+    参数 task_id：任务 ID。
+    返回：反序列化的 Task 对象。
+    """
     return Task(**json.loads(_task_path(task_id).read_text()))
 
 
 def list_tasks() -> list[Task]:
+    """列出所有任务，按文件名（即 ID）排序。
+
+    扫描 .tasks/task_*.json，逐个加载并返回 Task 列表。
+    返回：按时间戳排序的 Task 列表，可能为空。
+    """
     return [Task(**json.loads(p.read_text()))
             for p in sorted(TASKS_DIR.glob("task_*.json"))]
 
 
 def get_task(task_id: str) -> str:
-    """Return full task details as JSON."""
+    """返回单个任务的完整详情（JSON 格式字符串）。
+
+    参数 task_id：任务 ID。
+    返回：格式化 JSON 字符串，包含任务所有字段。
+    """
     task = load_task(task_id)
     return json.dumps(asdict(task), indent=2)
 
 
 def can_start(task_id: str) -> bool:
-    """检查所有 blockedBy 依赖是否已完成。缺失依赖 = 阻塞。"""
+    """检查任务的所有 blockedBy 依赖是否都已 completed。
+
+    规则：
+      - 依赖的文件不存在 = 视为阻塞（引用无效或被删除）
+      - 依赖状态 != "completed" = 阻塞
+      - 所有依赖都 completed = 可以开始
+
+    参数 task_id：要检查的任务 ID。
+    返回：True（可开始）或 False（被阻塞）。
+    """
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -153,6 +209,16 @@ def can_start(task_id: str) -> bool:
 
 
 def claim_task(task_id: str, owner: str = "agent") -> str:
+    """认领任务：pending → in_progress + 设置 owner。
+
+    前置条件：
+      1. 任务状态为 pending（尚未被他人认领）
+      2. 所有 blockedBy 依赖已完成（can_start == True）
+
+    参数 task_id：要认领的任务 ID。
+    参数 owner：认领者标识（默认 "agent"）。
+    返回：成功或失败的消息字符串。
+    """
     task = load_task(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
@@ -168,11 +234,21 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 
 
 def complete_task(task_id: str) -> str:
+    """完成任务：in_progress → completed + 级联解锁下游任务。
+
+    完成后自动扫描所有 pending 任务，如果某个任务的所有
+    blockedBy 依赖都已满足（其中最后一个就是这个完成的任务），
+    将其列入"被解除阻塞"列表。
+
+    参数 task_id：要完成的任务 ID。
+    返回：完成消息，可能包含被解除阻塞的下游任务列表。
+    """
     task = load_task(task_id)
     if task.status != "in_progress":
         return f"Task {task_id} is {task.status}, cannot complete"
     task.status = "completed"
     save_task(task)
+    # 扫描被此任务阻塞的 pending 任务
     unblocked = [t.subject for t in list_tasks()
                  if t.status == "pending" and t.blockedBy and can_start(t.id)]
     print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
@@ -197,6 +273,11 @@ PROMPT_SECTIONS = {
 
 
 def assemble_system_prompt(context: dict) -> str:
+    """根据 context 选择 + 拼接提示词片段（同 s10）。
+
+    始终包含：identity + tools + workspace。
+    条件包含：memory（仅当 MEMORY.md 有内容时）。
+    """
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
@@ -206,10 +287,15 @@ def assemble_system_prompt(context: dict) -> str:
     return "\n\n".join(sections)
 
 
+# 确定性缓存：context 不变时不重新组装字符串
 _last_context_key, _last_prompt = None, None
 
 
 def get_system_prompt(context: dict) -> str:
+    """获取 SYSTEM 提示词（带缓存）。
+
+    缓存 key 使用 json.dumps(sort_keys=True) 保证确定性。
+    """
     global _last_context_key, _last_prompt
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
     if key == _last_context_key and _last_prompt:
@@ -224,6 +310,12 @@ def get_system_prompt(context: dict) -> str:
 # ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
+    """将用户输入的路径解析为绝对路径，并检查是否在 WORKDIR 内。
+
+    参数 p：用户传入的相对路径或绝对路径字符串。
+    返回：解析后的绝对 Path 对象。
+    抛出 ValueError：如果路径逃逸了工作目录。
+    """
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -231,7 +323,17 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    """执行 Shell 命令。run_in_background 由 agent_loop 层处理，此函数不感知。"""
+    """执行 Shell 命令并返回输出。
+
+    超时 120 秒，输出最长 50000 字符。
+    注意 run_in_background 参数在函数体内从未被读取——它只负责"接住"
+    execute_tool 中 **block.input 展开时传过来的多余参数。
+    后台/同步的实际分发逻辑在 agent_loop 层完成。
+
+    参数 command：要执行的 Shell 命令。
+    参数 run_in_background：仅用于吸收 **block.input 展开的额外 key。
+    返回：命令的 stdout+stderr，截断到 50000 字符。
+    """
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -242,6 +344,12 @@ def run_bash(command: str, run_in_background: bool = False) -> str:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """读取文件内容，可选行数限制。
+
+    参数 path：文件路径（相对于 WORKDIR 或绝对路径）。
+    参数 limit：读取行数上限（可选）。
+    返回：文件内容字符串，超过 limit 时末尾标注剩余行数。
+    """
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -252,6 +360,12 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """写入文件（覆盖），自动创建父目录。
+
+    参数 path：文件路径（相对于 WORKDIR 或绝对路径）。
+    参数 content：要写入的文件内容。
+    返回：写入结果日志（包含字节数）。
+    """
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -261,9 +375,19 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
-# 任务工具包装（同 s12）
+# ── 任务工具包装（同 s12）──
+# 这些包装函数在核心 CRUD 之上添加了格式化输出和日志打印，
+# 使得 LLM 看到的返回结果更友好，同时终端能看到彩色日志。
+# 核心 CRUD 函数（create_task / list_tasks 等）可以被其他
+# 内部逻辑直接调用，包装函数则专门面向 LLM 工具调用场景。
+
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
+    """工具包装：创建任务 + 打印终端日志。
+
+    参数同 create_task。
+    返回：面向 LLM 的创建结果消息。
+    """
     task = create_task(subject, description, blockedBy)
     deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
     print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
@@ -271,6 +395,13 @@ def run_create_task(subject: str, description: str = "",
 
 
 def run_list_tasks() -> str:
+    """工具包装：列出所有任务，带图标和格式化输出。
+
+    图标说明：○ pending / ● in_progress / ✓ completed
+    每行格式：{图标} {ID}: {标题} [{状态}] [{owner}] (blockedBy: ...)
+
+    返回：格式化后的任务列表字符串。
+    """
     tasks = list_tasks()
     if not tasks:
         return "No tasks. Use create_task to add some."
@@ -286,6 +417,11 @@ def run_list_tasks() -> str:
 
 
 def run_get_task(task_id: str) -> str:
+    """工具包装：获取任务详情。
+
+    参数 task_id：要查询的任务 ID。
+    返回：任务完整 JSON 字符串，或未找到错误消息。
+    """
     try:
         return get_task(task_id)
     except FileNotFoundError:
@@ -293,10 +429,20 @@ def run_get_task(task_id: str) -> str:
 
 
 def run_claim_task(task_id: str) -> str:
+    """工具包装：认领任务（owner 固定为 "agent"）。
+
+    参数 task_id：要认领的任务 ID。
+    返回：认领结果消息。
+    """
     return claim_task(task_id, owner="agent")
 
 
 def run_complete_task(task_id: str) -> str:
+    """工具包装：完成任务。
+
+    参数 task_id：要完成的任务 ID。
+    返回：完成消息（含解锁下游通知）。
+    """
     return complete_task(task_id)
 
 
@@ -311,6 +457,9 @@ def run_complete_task(task_id: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
+    # ── 基础工具（s02 引入） ──
+    # bash 在 s13 新增了 run_in_background 参数，LLM 可主动声明
+    # 此命令需要后台执行（true）或同步执行（false/不传）。
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object",
                       "properties": {
@@ -327,6 +476,7 @@ TOOLS = [
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["path", "content"]}},
+    # ── 任务工具（s12 引入） ──
     {"name": "create_task",
      "description": "Create a new task with optional blockedBy dependencies.",
      "input_schema": {"type": "object",
@@ -361,6 +511,10 @@ TOOLS = [
 #  工具分发映射（TOOL_HANDLERS）
 # ═══════════════════════════════════════════════════════════
 
+# 工具名 → 执行函数的映射字典。
+# 当 LLM 调用某个工具时，agent_loop 从此表中查找对应的处理函数。
+# 注意：bash 对应 run_bash 而非 TOOL_HANDLER 的直接函数——run_bash
+# 的 run_in_background 参数在 agent_loop 中被预处理，不在分发层处理。
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -388,10 +542,11 @@ TOOL_HANDLERS = {
 #  线程安全：background_lock 保护所有共享字典的读写。
 # ═══════════════════════════════════════════════════════════
 
-_bg_counter = 0                                          # 后台任务 ID 计数器
+_bg_counter = 0                                          # 后台任务 ID 自增计数器（线程安全：仅在主线程递增）
 background_tasks: dict[str, dict] = {}                   # bg_id → {tool_use_id, command, status}
-background_results: dict[str, str] = {}                  # bg_id → 工具输出文本
-background_lock = threading.Lock()                       # 保护上述两个字典的互斥锁
+                                                         # status: "running" | "completed"
+background_results: dict[str, str] = {}                  # bg_id → 工具执行的输出文本
+background_lock = threading.Lock()                       # 保护 background_tasks / background_results 两个字典
 
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
@@ -522,7 +677,15 @@ def collect_background_results() -> list[str]:
 # ═══════════════════════════════════════════════════════════
 
 def update_context(context: dict, messages: list) -> dict:
-    """Derive context from real state."""
+    """从真实状态推导上下文字典。
+
+    每次调用重新检查 MEMORY.md 是否存在且有内容，
+    确保 context 反映最新状态。
+
+    参数 context：先前的上下文（未使用，预留给扩展）。
+    参数 messages：消息历史（未使用，预留给扩展）。
+    返回：包含 enabled_tools / workspace / memories 的字典。
+    """
     memories = ""
     if MEMORY_INDEX.exists():
         content = MEMORY_INDEX.read_text().strip()
@@ -631,17 +794,27 @@ if __name__ == "__main__":
     print("s13: background tasks")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
+    # 初始化 context（检查 .memory/MEMORY.md）
     context = update_context({}, [])
     while True:
+        # ─── 读取用户输入 ───
         try:
             query = input("\033[36ms13 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        # ─── 追加用户消息 → 进入 agent_loop ───
         history.append({"role": "user", "content": query})
         agent_loop(history, context)
+
+        # ─── agent_loop 返回后重新评估 context ───
+        # （后台任务可能写入了文件或 MEMORY.md）
         context = update_context(context, history)
+
+        # ─── 打印 LLM 最终文本 ───
+        # 兼容 dict 和 object 两种 block 格式
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
                 print(block.text)

@@ -112,6 +112,64 @@ dispatch 机制不变，task 工具通过 `TOOL_HANDLERS[block.name]` 分发。�
 
 ---
 
+## 注意事项
+
+### 1. 子 Agent 共享父 Agent 的模型，不能指定不同模型
+
+```python
+response = client.messages.create(
+    model=MODEL, system=SUB_SYSTEM, ...)  # MODEL 和父 Agent 一样
+```
+
+教学版的子 Agent 使用和父 Agent 相同的 `MODEL`。CC 的 subagent 支持指定不同模型（比如父 Agent 用 Opus 做规划，子 Agent 用 Sonnet/Haiku 做执行），以优化成本。
+
+### 2. 30 轮硬限制，超过则截断
+
+```python
+for _ in range(30):
+    ...
+```
+
+教学版固定 30 轮上限。如果子任务确实复杂需要更多轮，会被截断且没有提示。CC 的 subagent 轮数更灵活，可以配置（`maxTurns` 参数）。
+
+### 3. 返回值提取策略可能丢失关键信息
+
+```python
+result = extract_text(messages[-1]["content"])
+if not result:
+    for msg in reversed(messages):
+        if msg["role"] == "assistant":
+            result = extract_text(msg["content"])
+```
+
+先看最后一条消息的 text，如果为空（比如最后一步是 tool_result）就回溯找倒数第一条 assistant 消息。这个"回溯"策略的问题是：回溯到的可能是几轮之前的文本，而不是子 Agent 的最终结论。
+
+### 4. 中间结果完全丢弃，不可追溯
+
+```python
+# 只返回摘要——子 Agent 完整的 messages 历史被丢弃
+return result
+```
+
+子 Agent 的所有中间工具调用结果都被丢弃。如果父 Agent 需要某个中间结果（比如子 Agent 找到的文件路径），子 Agent 必须在摘要中明确报告。CC 的 subagent 支持选择性地保留中间结果。
+
+### 5. 父 Agent 阻塞等待子 Agent 完成
+
+子 Agent 执行期间，父 Agent 的 agent_loop 是阻塞的（`spawn_subagent` 是同步调用）。如果子 Agent 需要 10 分钟，父 Agent 干等 10 分钟。s13 的后台任务可以解决这个问题——子 Agent 也可以作为后台任务分发。
+
+### 与官方 Claude Code 对比
+
+| 方面 | 教学版 s06 | 官方 Claude Code |
+|------|-----------|-----------------|
+| 模型选择 | 共享父 Agent 模型 | 可指定不同模型/层级 |
+| 轮数限制 | 固定 30 轮 | 可配置 maxTurns |
+| 返回值 | 简单文本提取 | 结构化结果 + 自定义格式 |
+| 中间结果 | 完全丢弃 | 可选择保留 |
+| 执行方式 | 同步阻塞父 Agent | 支持后台执行（无阻塞） |
+| 递归保护 | 去掉 task 工具 | 递归检测 + 深度限制 |
+
+---
+
 ## 试一下
 
 ```sh

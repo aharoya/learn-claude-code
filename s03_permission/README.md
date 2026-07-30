@@ -129,6 +129,58 @@ for block in response.content:
 
 ---
 
+## 注意事项
+
+### 1. 用户确认是同步阻塞的
+
+```python
+def ask_user(tool_name, args, reason):
+    choice = input("   Allow? [y/N] ")  # ← 阻塞等待
+```
+
+s03 的所有权限确认通过 `input()` 同步等待。如果 Agent 在后台（无人看守）运行，Gate 3 会永久阻塞。CC 的权限系统支持持久化规则（`settings.json` 中的 `permissions` 字段），对已知命令自动放行，无需人工确认。
+
+### 2. DENY_LIST 是硬编码的
+
+```python
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", ...]
+```
+
+教学版的黑名单写在代码里，改策略要改源码。CC 的 deny/allow 规则通过 `settings.json` 配置，用户可以在项目级或全局级自由添加/移除规则，支持正则匹配。
+
+### 3. Gate 2 规则是简单的 lambda 判断
+
+```python
+PERMISSION_RULES = [
+    {"tools": ["bash"],
+     "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", ...]),
+     "message": "Potentially destructive command"},
+]
+```
+
+规则引擎用 lambda 做字符串包含判断，无法做上下文敏感的分析（比如 "rm file.txt" 和 "rm -rf /" 都用同一个规则）。CC 的权限系统基于 `MatchConfig` 模式，支持更精确的参数匹配。
+
+### 4. 被拒绝后 LLM 收到 "Permission denied"，没有细节
+
+```python
+results.append({"type": "tool_result", "tool_use_id": block.id,
+                "content": "Permission denied."})
+```
+
+教学版返回给 LLM 的只是简单的 "Permission denied."。CC 会返回更详细的拒绝原因（哪条规则、什么参数触发了检查），帮助 LLM 学习安全边界并自主调整行为。
+
+### 与官方 Claude Code 对比
+
+| 方面 | 教学版 s03 | 官方 Claude Code |
+|------|-----------|-----------------|
+| 规则存储 | 硬编码在代码中 | settings.json（项目级 + 用户级） |
+| 用户确认 | input() 同步阻塞 | 交互式 + 持久化规则记忆 |
+| 拒绝信息 | "Permission denied." | 详细拒绝原因 + 规则名称 |
+| 规则粒度 | 字符串包含 | MatchConfig + 精确参数匹配 |
+| Gate 顺序 | 硬编码三道门 | 可配置的 hook pipeline |
+
+---
+
 ## 试一下
 
 ```sh
