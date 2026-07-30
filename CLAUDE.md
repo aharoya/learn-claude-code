@@ -195,7 +195,7 @@ Tool Dispatch → Permission Gate → PreToolUse Hook → 执行 → PostToolUse
 - **`demo_code.py` 是独立可运行的**：每个章节的 `demo_code.py` 可直接 `python demo_code.py` 启动，无需跨章节依赖（但 s20 整合了所有前序机制）。
 - **测试使用 `importlib` 动态加载**：`tests/` 中的测试通过 `importlib` 导入各章节代码，并注入 `unittest.mock` 替换 `anthropic`/`dotenv`/`yaml`，使其无需真实 API Key 即可运行。
 - **旧版 `agents/` 保持同步**：旧版 12 课文件（`agents/s01_agent_loop.py` 等）应保持与新版 `s01/`-`s20/` 中对应章节的 `demo_code.py` 逻辑一致（见本文档末尾的章节对照表）。
-- **三语维护**：每个章节的 `README.md`（中文）是源文档，`README.en.md` 和 `README.ja.md` 是翻译，需保持同步更新。
+- **README 只维护中文版**：`README.md`（中文）是主源文档，`README.en.md` 和 `README.ja.md` 是自动翻译，修改时只改中文版，其他两语不管。
 
 ## 环境变量
 

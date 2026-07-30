@@ -38,6 +38,21 @@ TodoWrite vs Task System：
 | 状态 | pending / in_progress / completed | pending / in_progress / completed |
 | 粒度 | Agent 自己的步骤 | 可被认领、追踪、解锁的任务 |
 
+### 为什么任务操作是 Tool，不是 Subagent？
+
+s12 的所有任务操作（`create_task` / `claim_task` / `complete_task` 等）都是 **tool**——LLM 直接调用，没有 subagent 在背后执行。
+
+原因是：**s12 只做任务的数据管理，不做任务的执行。** 任务的数据管理和任务的执行是两件正交的事：
+
+| 关注点 | 做什么 | 在哪里 |
+|--------|--------|--------|
+| **任务数据层** | 创建工单、流转状态、检查依赖、查询列表 | s12 |
+| **任务执行层** | 谁去干活、怎么分工、启动 subagent、汇结果 | s15+ |
+
+回到你可能会有的困惑：s05 的 todo 是 Agent 写给自己看的便利贴，s12 的 task 是持久化的工单系统，但都还**没有"自动派单 + 自动执行"的能力**。谁来做这些任务？s12 不回答这个问题。s15 的团队协作才会把 task system + subagent 组合起来：一个 Agent 创建任务，另一个 Agent 认领，然后启动 subagent 去执行。
+
+打个比方：s12 像 GitHub Issues——只负责工单的创建、状态、依赖关系。谁去修这个 issue、怎么修，那是 CI/CD 或者团队协作的事。你不能说 Issues 没有自动修 bug 的能力是缺陷，因为它本来就不管这个。
+
 ---
 
 ## 工作原理
