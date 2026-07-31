@@ -38,11 +38,14 @@ TodoWrite vs Task System：
 | 状态 | pending / in_progress / completed | pending / in_progress / completed |
 | 粒度 | Agent 自己的步骤 | 可被认领、追踪、解锁的任务 |
 
-### 为什么任务操作是 Tool，不是 Subagent？
+### Task vs Subagent
 
-s12 的所有任务操作（`create_task` / `claim_task` / `complete_task` 等）都是 **tool**——LLM 直接调用，没有 subagent 在背后执行。
+**Task（任务工具）和 Subagent（子 Agent）是两回事，不是二选一。**
 
-原因是：**s12 只做任务的数据管理，不做任务的执行。** 任务的数据管理和任务的执行是两件正交的事：
+- **Task 是数据层**：`create_task` / `claim_task` / `complete_task` 等操作只是读写工单，没有 subagent 在背后执行。
+- **Subagent 是执行层**：真正派一个 Agent 去干活，跑自己的 LLM 循环，产生文件副作用。
+
+为什么 s12 的任务操作都是 tool？因为 **s12 只做任务的数据管理，不做任务的执行。** 任务的数据管理和任务的执行是两件正交的事：
 
 | 关注点 | 做什么 | 在哪里 |
 |--------|--------|--------|
