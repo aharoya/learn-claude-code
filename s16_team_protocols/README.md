@@ -182,6 +182,85 @@ LLM 返回非 tool_use
 
 ---
 
+## 协议是什么？怎么定义一个协议？
+
+### 协议是什么
+
+**协议 = 双方约定的结构化交互规则。** 它回答三件事：
+
+1. **说什么** —— 消息长什么样（字段、格式）
+2. **什么时候说** —— 什么情况下发、发给谁
+3. **怎么回应** —— 收到后对方必须怎么回
+
+不用协议时（s15）：Lead 发一句"你关了吧"，Alice 回一句"好的我关了"，Lead 只能靠猜判断"它到底关没关？"。两个 Agent 的自由 chat 是**非结构化**的，靠 LLM 理解，不可靠。
+
+用了协议（s16）：这是一次**握手**——可追踪、有状态、双方都按约定执行。
+
+> 最经典的类比是 **HTTP**：浏览器发 `GET /page`（请求），服务器必须回 `200 OK` 或 `404`（响应）。s16 的协议就是 Agent 之间的 HTTP。
+
+### 怎么定义一个协议 —— 四个要素
+
+以关机协议为例，定义一个协议需要四样东西：
+
+**① 消息类型（标记"这是协议消息"）**
+
+每种协议有 `xxx_request`（请求）和 `xxx_response`（响应）两种消息类型。消息在 MessageBus 上走，只是多打了 `type` 标签：
+
+```python
+if msg_type == "shutdown_request":   # 请求：Lead → Alice
+    ...
+BUS.send(name, "lead", "...", "shutdown_response",
+         {"request_id": req_id, "approve": True})
+#                                    ^^^^ 响应：Alice → Lead
+```
+
+**② 关联键 request_id（把请求和响应拴在一起）**
+
+请求和响应是两个独立消息，怎么知道 Alice 回的 `shutdown_response` 对应 Lead 发的那次请求？靠 `request_id`。请求带着它出去（`run_request_shutdown`），响应带着同一个它回来（`handle_inbox_message`）。**request_id 是贯穿全链路的关联键**，相当于 HTTP 请求里的 correlation ID。
+
+**③ 状态机（追踪请求的进度）**
+
+```python
+@dataclass
+class ProtocolState:
+    request_id: str
+    type: str        # "shutdown" | "plan_approval"
+    sender: str
+    target: str
+    status: str      # pending → approved / rejected
+    payload: str
+    created_at: float
+```
+
+状态流转只有一条路：`pending ──收到响应──→ approved / rejected`。发请求时 `status="pending"`，收到响应时 `match_response` 改成 `approved` 或 `rejected`。
+
+**④ 匹配逻辑（收到响应后做什么）**
+
+`match_response` 凭 `request_id` 找到原始请求，做三道校验后更新状态：
+
+```python
+state = pending_requests.get(request_id)   # ① request_id 必须存在
+if state.type == "shutdown" and response_type != "shutdown_response":
+    return                                  # ② 类型必须匹配（shutdown 不能批准 plan）
+if state.status != "pending":
+    return                                  # ③ 已处理的不重复处理
+state.status = "approved" if approve else "rejected"
+```
+
+### 定义一个新协议的最小步骤
+
+想加一种"加班确认协议"，照葫芦画瓢：
+
+1. **加状态类型**：`ProtocolState` 的 `type` 支持 `"overtime"`
+2. **定义两个消息类型**：`overtime_request`、`overtime_response`（带 `approve` 字段）
+3. **在 `handle_inbox_message` 加一个 `if` 分支**处理请求方
+4. **在 `match_response` 加类型校验**
+5. **用 `new_request_id()` + `ProtocolState` 发请求、用 `BUS.send` 发响应**
+
+协议的好处：**新增协议类型只需加新的 `if` 分支**——request_id + 状态机的骨架是复用的。这就是为什么说"两种协议，一套机制"。
+
+---
+
 ## 相对 s15 的变更
 
 | 组件 | 之前 (s15) | 之后 (s16) |
