@@ -172,6 +172,7 @@ Plan（生成计划）→ Execute（逐步执行）→ 反馈 → 必要时重�
 - `学习记录/13-LLM function calling 详解.md` — 工具调用的机制层（tool_use 块、两层 function calling、ReAct 文本协议）
 - `学习记录/12-s17 自治 Agent 机制.md` — 多 Agent 市场自治范式的具体实现
 - `学习记录/03-Harness 核心概念.md` — Harness 五要素（工具/知识/感知/行动/权限）
+- 参考blog：[面试官：说一下 Agent 的常见范式，如何选型？](https://www.cnblogs.com/yifeng-coding/p/20176474)
 
 ---
 
