@@ -119,6 +119,12 @@ def get_system_prompt(context: dict) -> str:
 
 用 `json.dumps` 而不是 `hash()`：Python 内置 `hash()` 有进程随机化，不适合做稳定 cache key，而且遇到 list/dict 会报 `unhashable type`。
 
+关于变量命名：`_last_context_key` 这个名字其实比"哈希"更准确——它存的不是真正的哈希值（如 MD5/SHA 那种定长指纹），而是 `json.dumps(context, sort_keys=True)` 序列化出来的**完整字符串**。这个字符串扮演"指纹"的角色，用来判断 context 有没有变化：内容变 → 字符串变 → 缓存失效；内容没变 → 字符串相同 → 缓存命中。后续章节（如 s17）把变量改叫 `_last_context_hash`，同样是"指纹"的泛称，不是算法意义上的哈希。
+
+为什么不真的用 hashlib 算个哈希？因为 context 极小（就 `enabled_tools` / `workspace` / `memories` 几个字段），两个字符串直接 `==` 比较，开销可以忽略。真正的哈希函数的价值在于把"任意大的内容"压缩成定长指纹，省存储、省比较成本——那是对比大文件、校验消息完整性时才需要的东西，这里大材小用。
+
+所以这个函数真正的灵魂是 `sort_keys=True`：它保证 dict 的 key 顺序不同时，序列化结果仍相同。否则 `{"memories": "a", "name": "b"}` 和 `{"name": "b", "memories": "a"}` 会序列化成两个不同的字符串，内容明明一样却误判为"变了"，缓存就永远不命中。
+
 注意：这里的缓存只是"避免重复拼接字符串"，和 CC 的 API prompt cache 不是一回事。CC 的 prompt cache 通过 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 分隔静态和动态部分，静态部分命中 global cache，不因动态内容变化而失效。
 
 ### context: 真实状态，不是关键词猜测

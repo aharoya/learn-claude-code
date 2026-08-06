@@ -207,6 +207,127 @@ if len(messages) <= 3:
 
 ---
 
+## 本节核心回顾（复习用）
+
+### 自治闭环：三个新函数串成一条链
+
+s17 的所有新机制可以浓缩成一个闭环，三个函数接力：
+
+```
+scan_unclaimed_tasks → claim_task → idle_poll(下一轮)
+       │                  │              │
+   找可认领的任务      认领并置 in_progress   回 WORK 干活 / 继续等
+```
+
+- **scan_unclaimed_tasks（扫描）**：`pending + 无 owner + 依赖全完成` 三条件过滤，找出"没人做、又能做"的任务
+- **claim_task（认领）**：三道校验（状态/owner/依赖）后才写入 owner + `in_progress`——教学版靠 owner 检查防"后写覆盖"，但没有文件锁，仍有 TOCTOU 窗口
+- **idle_poll（轮询）**：空闲时每 5s 唤醒，inbox 优先（shutdown 不能被饿死），其次扫描看板认领
+
+### 生命周期状态机：WORK → IDLE → SHUTDOWN
+
+```
+WORK ──(模型结束本轮)──→ IDLE ──(60s 无活/收到 shutdown)──→ SHUTDOWN
+  ↑                        │
+  └──(收到消息/认领成功)────┘
+```
+
+两个要点：
+1. **两处 inbox 读取点**：WORK 阶段走 `handle_inbox_message`（协议分发 + 返回是否退出）；IDLE 阶段 `idle_poll` 直接检查 shutdown_request 并立即响应——所以"正在干活"和"闲着没事"两个状态下，关机请求都不会被漏掉
+2. **合作式退出**：线程没有 `terminate()`，靠 `return` 自然结束。WORK 里 `should_shutdown=True` → break 外层循环；IDLE 里返回 `"shutdown"`/`"timeout"` → break——最终都落到循环外的 summary 发送
+
+### 协议：两种、一套机制（s16 继承）
+
+s17 的协议机制和 s16 完全一样，**没有新增协议类型**。两种协议，每种由一对 request/response 消息组成：
+
+| 协议 | 消息类型（一对） | 发起方 | 响应方 |
+|------|-----------------|--------|--------|
+| **shutdown**（关闭握手） | `shutdown_request` ↔ `shutdown_response` | Lead | 队友 |
+| **plan_approval**（计划审批） | `plan_approval_request` ↔ `plan_approval_response` | 队友 | Lead |
+
+两种协议共用同一套关联机制：`request_id` 关联 + `ProtocolState` 状态机（pending → approved/rejected）+ `match_response` 类型校验。
+
+**"协议" ≠ "消息类型"**：协议是一对 request-response 消息，靠 request_id 关联、进入状态机；普通消息（`message` 类型，如 `run_request_plan` 发的那条、队友的 `result` summary）没有 request_id、不进入状态机，只是普通通信，不构成协议。
+
+两条链方向相反：shutdown 是 **Lead 发起**（要关人），plan_approval 是 **队友发起**（要审批）——同一个机制、两个方向。
+
+### 竞态：没有文件锁的认领
+
+教学版 `claim_task` 的 owner 检查是"读时判断"，两个队友可能同时读到 `owner=None` 再同时写入（TOCTOU）。这在实际演示中概率很低（5s 轮询间隔拉开窗口），但要知道：**真正并发安全需要文件锁/原子操作**——CC 用 `proper-lockfile` 在锁内完成读-改-写，这是教学版刻意省略、留给读者思考的点。
+
+### inbox 消费式读取：展示工具为何会清空邮箱
+
+`run_check_inbox` 名义上是"读取并展示收件箱"，但调用它之后 Lead 的邮箱会被清空——这看起来矛盾。逐层拆开看，结论分两层：**清空本身没错，错的是 `run_check_inbox` 复用了消费式读取函数。**
+
+#### 一、清空是"继承"来的，不是 check_inbox 有意为之
+
+`run_check_inbox` 自己没有任何读取逻辑，它调的是统一入口 `consume_lead_inbox`，而底层是消费式读取（读后即删）：
+
+```python
+# BUS.read_inbox —— 读后即删
+msgs = [json.loads(line) for line in inbox.read_text().splitlines() if line.strip()]
+inbox.unlink()          # ← 清空在这里
+
+# consume_lead_inbox —— 路由协议 + 返回，清空是它实现的
+msgs = BUS.read_inbox("lead")   # 这一行已经把文件删了
+```
+
+所以"展示工具读完后邮箱空了"是**继承来的副作用**，不是 check_inbox 的设计意图。如果它真是纯展示，不该清空。
+
+#### 二、但清空是必要的——防重复消费
+
+如果改成"只读不清空"，问题更大：
+
+1. **同一批消息被注入两次**：check_inbox 以 `tool_result` 展示一次，主循环末尾又读一遍注入 `[Inbox]` 一次 → 模型看到双份，上下文冗余
+2. **协议响应被 `match_response` 处理两次** → 这里有个 s17 的退化点，见下面的薄弱点 1
+3. **模型反复调 check_inbox 永远看到旧消息**，无法区分新旧
+
+所以"消费式邮箱"（读走 = 已处理）在这个架构里是对的。**真正的问题不是清空，而是 check_inbox 顶着"展示"的名义做了"消费"的事，副作用对调用者不可见。**
+
+#### 三、真正的逻辑薄弱点（有两处）
+
+**薄弱点 1：s17 精简掉了幂等校验（s16→s17 退化）**
+
+对比两个版本：
+
+```python
+# s16 的 match_response —— 有第④步幂等校验
+if state.status != "pending":
+    return  # 已处理过的响应，忽略
+
+# s17 的 match_response —— 只有 unknown + type mismatch 两步
+state.status = "approved" if approve else "rejected"   # 直接改
+```
+
+当前因为"消费式读取 + 单线程顺序执行"，同一条响应只会被 `match_response` 碰一次，所以幂等校验缺失**暂时无害**。但这是一个埋在 s17 里的隐患：**只要有人把读取改成 peek（只读）或加了第二条消费路径，同一条响应就会被处理两次**——状态被重复覆盖、日志重复打印。s16 修掉的问题，在 s17 又敞开了门。
+
+**薄弱点 2：两条消费路径互斥，导致行为不确定**
+
+Lead 侧有**两个**入口都消费同一批消息：
+
+```
+路径A: agent_loop 中模型调用 check_inbox 工具 → 读走 + 清空
+路径B: agent_loop 结束后主循环末尾 → consume_lead_inbox → [Inbox] 注入
+```
+
+**谁先调，谁拿走；后调的拿到空。** 于是"队友的 summary 以什么形式进入 Lead 历史"取决于模型这一轮**是否恰好调用了 check_inbox**：
+
+- 模型调了 check_inbox → summary 在 `tool_result` 里，主循环末尾拿到空，`[Inbox]` 注入失效
+- 模型没调 → summary 在 `[Inbox]` 里，作为明确的 user 消息
+
+数据层面没丢（`tool_result` 也在 history 里），但**行为变得不确定**。还有个轻微后果：队友的 shutdown_response 如果被 check_inbox 读走并路由，状态机更新了，但 Lead 的 LLM 只能从那一轮 `tool_result` 里知道"队友已确认关机"——它**没有**被 `[Inbox]` 单独提示。状态机与 LLM 认知之间出现了脱节窗口。
+
+#### 四、结论
+
+| 观察 | 判断 |
+|------|------|
+| "展示用却清空" | 表面矛盾，但**清空是对的**（防重复消费），错在 check_inbox 复用了消费式函数却顶着展示的名义 |
+| s17 的 match_response 无幂等校验 | **真实隐患**：s16 有、s17 精简掉了，目前无害但一改就爆 |
+| 两条消费路径互斥 | 行为不确定，但不是数据丢失，是设计脆弱点 |
+
+**改进方向**（如果要做）：给 `MessageBus` 加一个 `peek_inbox`（只读不删），`run_check_inbox` 用它做纯展示；消费只留给主循环末尾这一条路径。同时把 s17 `match_response` 的幂等校验补回来，避免重复响应覆盖状态。
+
+---
+
 ## 试一下
 
 ```sh
