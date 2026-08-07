@@ -245,6 +245,33 @@ def run_git(args: list[str]) -> tuple[bool, str]:
 
 ---
 
+## 本节总结
+
+**一句话**：s18 不是"加了几个 tool"，而是**把 git worktree 封装成一套"任务↔目录绑定 + 自动切换 + 安全审计"的隔离机制**。三个 tool（`create_worktree`/`remove_worktree`/`keep_worktree`）只是 Lead 触发它的入口，真正的关键在下面的四层：
+
+### 四层机制
+
+| 层 | 内容 | 作用 |
+|----|------|------|
+| **① 数据层** | Task 新增 `worktree` 字段 | 记录"这个任务绑定在哪个工作目录" |
+| **② 工具层** | 3 个 Lead tool：`create_worktree`/`remove_worktree`/`keep_worktree` | 让 Lead 的 LLM 能创建/清理/保留 worktree |
+| **③ 执行层（核心）** | 队友 `wt_ctx` 记录当前 worktree，`_run_bash/_run_read/_run_write` 带 cwd 执行 | **队友认领带 worktree 的任务后，工具自动切到那个目录干活**——不用提醒，代码层面就隔离了 |
+| **④ 安全层** | `validate_worktree_name`（防路径穿越）、`remove` 前查未提交改动、`events.jsonl` 审计 | 防止乱建乱删、操作可追溯 |
+
+### 记住三个关键设计
+
+1. **绑定不改状态**：`bind_task_to_worktree` 只写 `worktree` 字段，任务保持 `pending`——Lead 可提前建好任务+worktree，队友 idle 时自然认领
+2. **两条认领路径都切 cwd**：工具认领（`_run_claim_task`）和 idle 自动认领（`idle_poll` 返回 task_id 后外层切）都会设置 `wt_ctx`，两条路不遗漏
+3. **完成即脱离**：`_run_complete_task` 完成后把 `wt_ctx` 重置为 None，队友回到主仓库，防止下个任务串进上个 worktree
+
+### 和 s17 的本质区别
+
+- **s17 解决"谁干什么"**（任务系统：Lead 创建 → 队友认领）
+- **s18 解决"在哪干"**（目录隔离：任务绑定 worktree → 队友自动进对目录）
+- 两者叠加：**s17 管任务分配，s18 管执行隔离**，合起来才是完整的多 Agent 协作
+
+---
+
 ## 试一下
 
 ```sh
